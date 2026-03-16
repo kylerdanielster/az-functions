@@ -14,8 +14,8 @@ public record CreateFileInput<T>(string InstanceId, T Data);
 
 public static class SftpOrchestration
 {
-    private const string PersonReceivedEvent = "PersonReceived";
-    private const string AddressReceivedEvent = "AddressReceived";
+    internal const string PersonReceivedEvent = "PersonReceived";
+    internal const string AddressReceivedEvent = "AddressReceived";
     private static readonly TimeSpan SftpTimeout = TimeSpan.FromSeconds(30);
 
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(

@@ -24,6 +24,7 @@ Single Durable Functions orchestration (`SftpOrchestration`) using the **externa
 ```
 Program.cs                    Entry point and DI configuration
 SftpOrchestration.cs          Orchestrator, activities, HTTP triggers
+SftpDataFeed.cs               Timer trigger — generates data and starts orchestration on app startup
 host.json                     Azure Functions and durable task config
 docker-compose.yml            Azurite + SFTP containers for local dev
 tools/generate-test-data/     Bogus-based fake data generator
