@@ -273,6 +273,44 @@ curl -s http://localhost:7071/api/sftp/files | python3 -m json.tool
 curl -s http://localhost:7071/api/sftp/files/person_xxx.txt
 ```
 
+## SFTP via SSH.NET
+
+SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`), a .NET library for SSH and SFTP operations. The project uses its `SftpClient` class to connect, upload, list, and read files on a remote SFTP server.
+
+### How it's used
+
+The `SftpClient` is created in three places, all within `SftpOrchestration.cs`:
+
+- **`UploadFiles` activity** — connects to the SFTP server, uploads person and address files to the configured remote path, then deletes the local temp files.
+- **`ListFiles` HTTP trigger** — connects and lists all files in the remote upload directory.
+- **`GetFile` HTTP trigger** — connects and reads the contents of a specific file by name.
+
+Each usage follows the same pattern:
+
+```csharp
+using var client = new SftpClient(host, port, username, password);
+client.OperationTimeout = TimeSpan.FromSeconds(30);
+client.Connect();
+// ... upload, list, or read files
+// client is disposed (and disconnected) by the using statement
+```
+
+### Configuration
+
+Connection details are read from environment variables (set in `local.settings.json` for local dev):
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SFTP_HOST` | Yes | — | SFTP server hostname |
+| `SFTP_PORT` | No | `22` | SFTP server port |
+| `SFTP_USERNAME` | Yes | — | Login username |
+| `SFTP_PASSWORD` | Yes | — | Login password |
+| `SFTP_REMOTE_PATH` | No | `/upload` | Remote directory for uploads |
+
+### Local development
+
+For local testing, the Docker Compose setup includes an OpenSSH server container that acts as the SFTP server (see Docker Services below). The `local.settings.json` values point to this container (`localhost:2222`, user `testuser`, password `testpass`).
+
 ## Docker Services
 
 | Service | Image | Ports | Purpose |
