@@ -1,35 +1,41 @@
 # CLAUDE.md
 
-This file provides core guidance to Claude Code. Detailed standards are in `docs/`.
+This file provides core guidance to Claude Code.
 
-## Design Principles
+## Language & Toolchain
 
-- **Dependency Inversion**: High-level modules should not depend on low-level modules. Both should depend on abstractions.
-- **Open/Closed Principle**: Software entities should be open for extension but closed for modification.
-- **Single Responsibility**: Each function, class, and module should have one clear purpose.
-- **Fail Fast**: Check for potential errors early and raise exceptions immediately when issues occur.
+C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP.
 
-## Core Development Philosophy
+## Architecture
 
-### KISS (Keep It Simple, Stupid)
+Single Durable Functions orchestration (`SftpOrchestration`) using the **external events** pattern:
 
-Simplicity should be a key goal in design. Choose straightforward solutions over complex ones whenever possible. Simple solutions are easier to understand, maintain, and debug.
+1. `POST /api/sftp/start` — creates orchestration, returns instance ID
+2. Orchestrator waits on two `WaitForExternalEvent` calls (person + address)
+3. `Task.WhenAll` fan-in — both events must arrive before proceeding
+4. Person and address files created as parallel activities
+5. Both files uploaded to SFTP after creation completes
 
-### YAGNI (You Aren't Gonna Need It)
+**State storage**: Azure Storage (Azurite locally) via `AzureWebJobsStorage` + `host.json` durable task config.
 
-Avoid building functionality on speculation. Implement features only when they are needed, not when you anticipate they might be useful in the future.
+**SFTP**: SSH.NET (`Renci.SshNet`). Local server via OpenSSH Docker container (port 2222).
 
-### Be Consistent
-
-Avoid backwards compatability mappers and wrappers. Update the code to be consistent instead.
+**File layout**:
+```
+Program.cs                    Entry point and DI configuration
+SftpOrchestration.cs          Orchestrator, activities, HTTP triggers
+host.json                     Azure Functions and durable task config
+docker-compose.yml            Azurite + SFTP containers for local dev
+tools/generate-test-data/     Bogus-based fake data generator
+test-sftp-orchestration.sh    E2E test script
+```
 
 ## AI Assistant Guidelines
 
 ### Context Awareness
 - When implementing features, always check existing patterns first
-- Prefer composition over inheritance in all designs
 - Use existing utilities before creating new ones
-- Check for similar functionality in other domains/features
+- Check for similar functionality in other functions/modules
 
 ### Common Pitfalls to Avoid
 - Creating duplicate functionality
@@ -39,11 +45,11 @@ Avoid backwards compatability mappers and wrappers. Update the code to be consis
 
 ## Important Notes
 
-- **NEVER ASSUME OR GUESS** - When in doubt, ask for clarification
+- **NEVER ASSUME OR GUESS** — When in doubt, ask for clarification
 - **Always verify file paths and module names** before use
 - **Keep CLAUDE.md updated** when adding new patterns or dependencies
-- **Test your code** - No feature is complete without tests
-- **Document your decisions** - Future developers (including yourself) will thank you
+- **Test your code** — No feature is complete without tests
+- **Document your decisions** — Future developers (including yourself) will thank you
 
 ## Search Command Requirements
 
@@ -54,35 +60,26 @@ Avoid backwards compatability mappers and wrappers. Update the code to be consis
 rg "pattern"
 
 # Don't use find -name — use rg --files instead
-rg --files -g "*.py"
+rg --files -g "*.cs"
 ```
 
-**Enforcement Rules:**
+## Build Commands
 
-```
-(
-    r"^grep\b(?!.*\|)",
-    "Use 'rg' (ripgrep) instead of 'grep' for better performance and features",
-),
-(
-    r"^find\s+\S+\s+-name\b",
-    "Use 'rg --files | rg pattern' or 'rg --files -g pattern' instead of 'find -name' for better performance",
-),
+```bash
+dotnet build          # build the project
+dotnet restore        # restore NuGet packages
+func start            # run locally (requires Docker services)
+docker compose up -d  # start Azurite + SFTP containers
 ```
 
-## Conditional Standards (read only when relevant)
+## Auto-Loaded Rules (`.claude/rules/`)
 
-Before making any code changes, read `docs/CODING_STANDARDS.md`.
+These load automatically based on context — no action needed:
 
-Before writing tests or as a validation gate after code changes, read `docs/TESTING_STANDARDS.md`.
-
-Before planning features or exploring the codebase, read `docs/PROJECT_ARCHITECTURE.md`.
-
-
-Before creating commits, branches, or PRs, read `docs/GIT_WORKFLOW.md`.
-
-Before adding logging, debugging log output issues, or modifying logging configuration, read `docs/LOGGING_SYSTEM.md`.
+- `dotnet-coding.md` — loaded when editing `.cs` files. Null safety, naming, Durable Functions patterns, logging.
+- `testing.md` — loaded when working with test files. E2E test flow, verification steps.
+- `git-workflow.md` — loaded for git operations. Branch naming, commit format, PR guidelines.
 
 ## Useful Resources
 
-- TODO: As necessary 
+- TODO: As necessary

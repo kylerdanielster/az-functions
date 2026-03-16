@@ -1,8 +1,15 @@
+---
+globs: "*.sh,*test*"
+description: Testing standards for E2E test scripts and verification
+---
+
 # Testing Standards
+
+These rules apply when working with test files and scripts.
 
 ## End-to-End Testing
 
-The primary test mechanism is `test-sftp-orchestration.sh`, which exercises the full orchestration flow.
+The primary test mechanism is `test-sftp-orchestration.sh`.
 
 ### Prerequisites
 
@@ -16,15 +23,13 @@ The primary test mechanism is `test-sftp-orchestration.sh`, which exercises the 
 ```
 
 The script:
-1. Generates fake person and address data using `tools/generate-test-data`
+1. Generates fake data using `tools/generate-test-data`
 2. Starts an orchestration instance
-3. Sends person and address data to the instance
-4. Polls the status endpoint until completion
-5. Lists and displays uploaded files on the SFTP server
+3. Sends person and address data
+4. Polls status until completion
+5. Verifies uploaded files on the SFTP server
 
 ### Test Data Generation
-
-The `tools/generate-test-data` project uses the Bogus library to generate realistic fake data:
 
 ```bash
 cd tools/generate-test-data
@@ -33,12 +38,14 @@ dotnet run -- --address   # Generate address JSON
 dotnet run                # Generate both
 ```
 
-### Manual Testing
-
-Use curl commands against `http://localhost:7071/api/sftp/...`. See the README for detailed step-by-step instructions.
-
 ### Verifying SFTP Uploads
 
 - **API**: `GET /api/sftp/files` and `GET /api/sftp/files/{fileName}`
 - **Filesystem**: `ls ./sftp-data/`
 - **SSH**: `ssh -p 2222 testuser@localhost` (password: `testpass`)
+
+## Before Submitting Code
+
+- E2E test passes end-to-end
+- New functions have corresponding curl-based test steps
+- Both happy path and error paths verified

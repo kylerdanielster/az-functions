@@ -1,10 +1,18 @@
-# Coding Standards
+---
+globs: "*.cs"
+description: .NET coding standards and safety guardrails for C# source files
+---
+
+# .NET Coding Standards
+
+These rules apply when editing `.cs` files.
 
 ## Naming
 
 - **PascalCase** for public types, methods, properties, and constants
 - **camelCase** for local variables, parameters, and private fields
 - Use `nameof()` for function names in attributes and string references
+- Use `const` for string literals referenced in multiple places (e.g., event names)
 
 ## Types
 
@@ -39,10 +47,30 @@ if (data is null)
 
 ## Environment Variables
 
-Access environment variables with `Environment.GetEnvironmentVariable()`. Use `?? throw` for required settings and `?? "default"` for optional settings with defaults.
+Access via `Environment.GetEnvironmentVariable()`. Use `?? throw` for required settings and `?? "default"` for optional settings with defaults.
 
 ## External Connections (SFTP, HTTP, etc.)
 
 - Use `using var` for disposable clients — do not call `Disconnect()` explicitly
 - Set `OperationTimeout` to prevent indefinite hangs
 - Clean up temporary files after use
+- Validate user-supplied paths and filenames (reject `..`, `/`, `\`)
+
+## Durable Functions
+
+- Use `context.CreateReplaySafeLogger()` in orchestrators — prevents duplicate logs during replay
+- Use `executionContext.GetLogger()` in activities and HTTP triggers
+- Prefix all log messages with `[SFTP]` for filtering
+- Use `LogInformation` for milestones, `LogWarning` for non-fatal issues, `LogError` for failures
+
+## Application Insights
+
+Configured in `host.json`:
+- Sampling enabled (reduces telemetry volume in production)
+- `Request` type excluded from sampling (all requests are captured)
+- Live Metrics filters enabled
+
+## Before Committing
+
+1. `dotnet build` — zero warnings, zero errors
+2. Run E2E test if changes affect orchestration flow
