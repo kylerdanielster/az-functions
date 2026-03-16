@@ -17,6 +17,11 @@ public static class SftpOrchestration
     private const string PersonReceivedEvent = "PersonReceived";
     private const string AddressReceivedEvent = "AddressReceived";
     private static readonly TimeSpan SftpTimeout = TimeSpan.FromSeconds(30);
+
+    private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
+        maxNumberOfAttempts: 3,
+        firstRetryInterval: TimeSpan.FromSeconds(5)));
+
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context)
@@ -43,13 +48,26 @@ public static class SftpOrchestration
         string personFilePath = personFileTask.Result;
         string addressFilePath = addressFileTask.Result;
 
-        // Upload only after both files are ready
+        // Upload each file independently with retry — parallel fan-out
         logger.LogInformation("[SFTP] Orchestration {id} — uploading 2 files to SFTP server...", id);
-        string result = await context.CallActivityAsync<string>(
-            nameof(UploadFiles), new[] { personFilePath, addressFilePath });
+        string[] filePaths = [personFilePath, addressFilePath];
+        try
+        {
+            var uploadPersonTask = context.CallActivityAsync<string>(
+                nameof(UploadFile), personFilePath, UploadRetryOptions);
+            var uploadAddressTask = context.CallActivityAsync<string>(
+                nameof(UploadFile), addressFilePath, UploadRetryOptions);
+            await Task.WhenAll(uploadPersonTask, uploadAddressTask);
+        }
+        catch (TaskFailedException ex)
+        {
+            logger.LogError(ex, "[SFTP] Orchestration {id} — upload failed after retries.", id);
+            await context.CallActivityAsync(nameof(CleanupTempFiles), filePaths);
+            throw;
+        }
 
         logger.LogInformation("[SFTP] Orchestration {id} — complete!", id);
-        return result;
+        return $"Uploaded 2 files: {Path.GetFileName(personFilePath)}, {Path.GetFileName(addressFilePath)}.";
     }
 
     [Function(nameof(CreatePersonFile))]
@@ -76,10 +94,10 @@ public static class SftpOrchestration
         return path;
     }
 
-    [Function(nameof(UploadFiles))]
-    public static string UploadFiles([ActivityTrigger] string[] filePaths, FunctionContext executionContext)
+    [Function(nameof(UploadFile))]
+    public static string UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger(nameof(UploadFiles));
+        ILogger logger = executionContext.GetLogger(nameof(UploadFile));
 
         string host = Environment.GetEnvironmentVariable("SFTP_HOST")
             ?? throw new InvalidOperationException("SFTP_HOST not configured.");
@@ -90,26 +108,40 @@ public static class SftpOrchestration
             ?? throw new InvalidOperationException("SFTP_PASSWORD not configured.");
         string remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
 
+        string fileName = Path.GetFileName(localPath);
+        string remoteFilePath = $"{remotePath}/{fileName}";
+
         using var client = new SftpClient(host, port, username, password);
         client.OperationTimeout = SftpTimeout;
         client.Connect();
         logger.LogInformation("[SFTP] Connected to SFTP server {host}:{port}.", host, port);
 
-        foreach (string localPath in filePaths)
-        {
-            string remoteFilePath = $"{remotePath}/{Path.GetFileName(localPath)}";
-            using var fileStream = File.OpenRead(localPath);
-            client.UploadFile(fileStream, remoteFilePath);
-            logger.LogInformation("[SFTP] Uploaded {fileName} to {remote}.", Path.GetFileName(localPath), remoteFilePath);
-        }
+        using var fileStream = File.OpenRead(localPath);
+        client.UploadFile(fileStream, remoteFilePath);
+        logger.LogInformation("[SFTP] Uploaded {fileName} to {remote}.", fileName, remoteFilePath);
 
-        foreach (string localPath in filePaths)
-        {
-            try { File.Delete(localPath); }
-            catch (Exception ex) { logger.LogWarning(ex, "[SFTP] Failed to delete temp file {path}.", localPath); }
-        }
+        try { File.Delete(localPath); }
+        catch (Exception ex) { logger.LogWarning(ex, "[SFTP] Failed to delete temp file {path}.", localPath); }
 
-        return $"Uploaded {filePaths.Length} files to {host}:{remotePath}.";
+        return $"Uploaded {fileName} to {remoteFilePath}.";
+    }
+
+    [Function(nameof(CleanupTempFiles))]
+    public static void CleanupTempFiles([ActivityTrigger] string[] filePaths, FunctionContext executionContext)
+    {
+        ILogger logger = executionContext.GetLogger(nameof(CleanupTempFiles));
+        foreach (string path in filePaths)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                    logger.LogInformation("[SFTP] Cleaned up temp file {path}.", path);
+                }
+            }
+            catch (Exception ex) { logger.LogWarning(ex, "[SFTP] Failed to clean up temp file {path}.", path); }
+        }
     }
 
     // --- HTTP Triggers ---

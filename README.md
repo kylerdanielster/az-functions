@@ -118,7 +118,7 @@ POST /api/sftp/start
         CreatePersonFile  CreateAddressFile   (parallel)
               └─────┬─────┘
                     ▼
-              UploadFiles via SFTP
+              UploadFile (per file, with retry)
 ```
 
 ### Example usage
@@ -281,7 +281,7 @@ SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`
 
 The `SftpClient` is created in three places, all within `SftpOrchestration.cs`:
 
-- **`UploadFiles` activity** — connects to the SFTP server, uploads person and address files to the configured remote path, then deletes the local temp files.
+- **`UploadFile` activity** — connects to the SFTP server, uploads a single file to the configured remote path, then deletes the local temp file. Called once per file with a retry policy (3 attempts, 5s backoff).
 - **`ListFiles` HTTP trigger** — connects and lists all files in the remote upload directory.
 - **`GetFile` HTTP trigger** — connects and reads the contents of a specific file by name.
 
