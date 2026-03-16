@@ -32,7 +32,8 @@ This file is gitignored. Create it in the project root:
     "SFTP_PORT": "2222",
     "SFTP_USERNAME": "testuser",
     "SFTP_PASSWORD": "testpass",
-    "SFTP_REMOTE_PATH": "/config/upload"
+    "SFTP_REMOTE_PATH": "/config/upload",
+    "ORCHESTRATION_BASE_URL": "http://localhost:7071/api"
   }
 }
 ```
@@ -69,24 +70,31 @@ The app runs on port 7071.
 
 ## Data Feed
 
-The `SftpDataFeed` function (`SftpDataFeed.cs`) is a timer trigger that fires on app startup (`RunOnStartup = true`). It exercises the full orchestration pipeline by generating fake data and driving it through to SFTP upload.
+The `SftpDataFeed` function (`SftpDataFeed.cs`) is a timer trigger that fires on app startup (`RunOnStartup = true`). It drives the full orchestration pipeline by generating fake data and sending it via HTTP to the orchestration endpoints.
 
-In production, this function will pull data from an external service. For now, it uses [Bogus](https://github.com/bchavez/Bogus) to generate random person and address data as a placeholder.
+In production, this function will live in a separate function app and pull data from an external service. For now, it uses [Bogus](https://github.com/bchavez/Bogus) to generate random person and address data as a placeholder. It communicates with the orchestration exclusively over HTTP, so it's already decoupled and ready for separate deployment.
 
 ### What it does
 
 1. Generates a random `PersonData` and `AddressData` using Bogus
-2. Starts a new orchestration instance via `DurableTaskClient`
-3. Raises both `PersonReceived` and `AddressReceived` external events
-4. The orchestration completes asynchronously (file creation, SFTP upload)
+2. `POST /api/sftp/start` — starts a new orchestration, extracts the instance ID
+3. `POST /api/sftp/person/{instanceId}` — sends person data
+4. `POST /api/sftp/address/{instanceId}` — sends address data
+5. The orchestration completes asynchronously (file creation, SFTP upload)
+
+### Configuration
+
+| Variable | Required | Description |
+|---|---|---|
+| `ORCHESTRATION_BASE_URL` | Yes | Base URL of the orchestration function app (e.g., `http://localhost:7071/api`) |
 
 ### Expected log output on startup
 
 ```
 [SFTP] Data feed starting — person: <first> <last>, address: <street>, <city>.
 [SFTP] Data feed orchestration <id> created.
-[SFTP] Data feed orchestration <id> — person event raised.
-[SFTP] Data feed orchestration <id> — events raised, orchestration will complete asynchronously.
+[SFTP] Data feed orchestration <id> — person data sent.
+[SFTP] Data feed orchestration <id> — address data sent, orchestration will complete asynchronously.
 ```
 
 ## SFTP Orchestration

@@ -1,11 +1,12 @@
+using System.Net.Http.Json;
+using System.Text.Json;
 using Bogus;
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
 
 namespace Company.Function;
 
-public static class SftpDataFeed
+public class SftpDataFeed(IHttpClientFactory httpClientFactory)
 {
     private static readonly Faker<PersonData> PersonFaker = new Faker<PersonData>()
         .CustomInstantiator(f => new PersonData(
@@ -20,35 +21,60 @@ public static class SftpDataFeed
             f.Address.StateAbbr(),
             f.Address.ZipCode("#####")));
 
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
     [Function(nameof(RunDataFeed))]
-    public static async Task RunDataFeed(
-        [TimerTrigger("0 0 0 1 1 *", RunOnStartup = true)] TimerInfo timerInfo,
-        [DurableClient] DurableTaskClient client,
+    public async Task RunDataFeed(
+        [TimerTrigger("0 0 0 * * *")] TimerInfo timerInfo,
         FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(SftpDataFeed));
 
         try
         {
+            string baseUrl = Environment.GetEnvironmentVariable("ORCHESTRATION_BASE_URL")
+                ?? throw new InvalidOperationException("ORCHESTRATION_BASE_URL not configured.");
+
             var person = PersonFaker.Generate();
             var address = AddressFaker.Generate();
 
             logger.LogInformation("[SFTP] Data feed starting — person: {first} {last}, address: {street}, {city}.",
                 person.FirstName, person.LastName, address.Street, address.City);
 
-            string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
-                nameof(SftpOrchestration));
+            using var httpClient = httpClientFactory.CreateClient();
+
+            // Start the orchestration
+            var startResponse = await httpClient.PostAsync($"{baseUrl}/sftp/start", null);
+            startResponse.EnsureSuccessStatusCode();
+
+            using var startBody = await JsonDocument.ParseAsync(
+                await startResponse.Content.ReadAsStreamAsync());
+            string instanceId = startBody.RootElement.TryGetProperty("id", out var idProp)
+                ? idProp.GetString() ?? throw new InvalidOperationException("Start response missing 'id'.")
+                : startBody.RootElement.GetProperty("Id").GetString()
+                    ?? throw new InvalidOperationException("Start response missing 'Id'.");
+
             logger.LogInformation("[SFTP] Data feed orchestration {id} created.", instanceId);
 
-            await client.RaiseEventAsync(instanceId, SftpOrchestration.PersonReceivedEvent, person);
-            logger.LogInformation("[SFTP] Data feed orchestration {id} — person event raised.", instanceId);
+            // Send person data
+            var personResponse = await httpClient.PostAsJsonAsync(
+                $"{baseUrl}/sftp/person/{instanceId}", person, JsonOptions);
+            personResponse.EnsureSuccessStatusCode();
+            logger.LogInformation("[SFTP] Data feed orchestration {id} — person data sent.", instanceId);
 
-            await client.RaiseEventAsync(instanceId, SftpOrchestration.AddressReceivedEvent, address);
-            logger.LogInformation("[SFTP] Data feed orchestration {id} — events raised, orchestration will complete asynchronously.", instanceId);
+            // Send address data
+            var addressResponse = await httpClient.PostAsJsonAsync(
+                $"{baseUrl}/sftp/address/{instanceId}", address, JsonOptions);
+            addressResponse.EnsureSuccessStatusCode();
+            logger.LogInformation("[SFTP] Data feed orchestration {id} — address data sent, orchestration will complete asynchronously.", instanceId);
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "[SFTP] Data feed failed.");
         }
     }
+
 }
