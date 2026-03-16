@@ -40,42 +40,11 @@ public static class SftpDataFeed
                 nameof(SftpOrchestration));
             logger.LogInformation("[SFTP] Data feed orchestration {id} created.", instanceId);
 
-            await Task.Delay(TimeSpan.FromSeconds(2));
-
             await client.RaiseEventAsync(instanceId, SftpOrchestration.PersonReceivedEvent, person);
             logger.LogInformation("[SFTP] Data feed orchestration {id} — person event raised.", instanceId);
 
             await client.RaiseEventAsync(instanceId, SftpOrchestration.AddressReceivedEvent, address);
-            logger.LogInformation("[SFTP] Data feed orchestration {id} — address event raised.", instanceId);
-
-            for (int i = 1; i <= 30; i++)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(2));
-                var metadata = await client.GetInstanceAsync(instanceId, getInputsAndOutputs: true);
-
-                if (metadata is null)
-                {
-                    logger.LogError("[SFTP] Data feed orchestration {id} — instance not found.", instanceId);
-                    return;
-                }
-
-                logger.LogInformation("[SFTP] Data feed orchestration {id} — poll {attempt}: {status}.",
-                    instanceId, i, metadata.RuntimeStatus);
-
-                if (metadata.RuntimeStatus == OrchestrationRuntimeStatus.Completed)
-                {
-                    logger.LogInformation("[SFTP] Data feed orchestration {id} — complete!", instanceId);
-                    return;
-                }
-
-                if (metadata.RuntimeStatus == OrchestrationRuntimeStatus.Failed)
-                {
-                    logger.LogError("[SFTP] Data feed orchestration {id} — failed.", instanceId);
-                    return;
-                }
-            }
-
-            logger.LogError("[SFTP] Data feed orchestration {id} — timed out after 30 poll attempts.", instanceId);
+            logger.LogInformation("[SFTP] Data feed orchestration {id} — events raised, orchestration will complete asynchronously.", instanceId);
         }
         catch (Exception ex)
         {

@@ -78,8 +78,7 @@ In production, this function will pull data from an external service. For now, i
 1. Generates a random `PersonData` and `AddressData` using Bogus
 2. Starts a new orchestration instance via `DurableTaskClient`
 3. Raises both `PersonReceived` and `AddressReceived` external events
-4. Polls the orchestration status until it completes or fails
-5. Logs the outcome
+4. The orchestration completes asynchronously (file creation, SFTP upload)
 
 ### Expected log output on startup
 
@@ -87,9 +86,7 @@ In production, this function will pull data from an external service. For now, i
 [SFTP] Data feed starting — person: <first> <last>, address: <street>, <city>.
 [SFTP] Data feed orchestration <id> created.
 [SFTP] Data feed orchestration <id> — person event raised.
-[SFTP] Data feed orchestration <id> — address event raised.
-[SFTP] Data feed orchestration <id> — poll 1: Completed.
-[SFTP] Data feed orchestration <id> — complete!
+[SFTP] Data feed orchestration <id> — events raised, orchestration will complete asynchronously.
 ```
 
 ## SFTP Orchestration
