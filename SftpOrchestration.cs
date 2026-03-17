@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
@@ -8,9 +9,9 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// SFTP Processor (App 2) orchestration and activities. Creates person/address files,
-/// uploads each independently to the SFTP server with retry (per-file error isolation),
-/// and sends a completion callback with per-file results to the Coordinator.
+/// SFTP Processor (App 2) orchestration and activities. Generates person/address file
+/// content in memory and uploads each independently to the SFTP server with retry
+/// (per-file error isolation). Sends a completion callback with per-file results to the Coordinator.
 /// Callback failure is isolated from file uploads — see <see cref="RunOrchestrator"/>.
 /// </summary>
 public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory)
@@ -29,8 +30,8 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     };
 
     /// <summary>
-    /// Durable Functions orchestrator. Creates person and address files in parallel,
-    /// then uploads each independently to SFTP with retry. Each file has its own try/catch
+    /// Durable Functions orchestrator. Generates person and address file content in parallel,
+    /// then uploads each from memory to SFTP with retry. Each file has its own try/catch
     /// so a failure in one doesn't prevent the other. Sends a callback with per-file results.
     /// Callback failure is isolated — if the callback fails after retries, the orchestration
     /// still completes (files are already uploaded).
@@ -48,16 +49,19 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, item {itemId}.",
             id, request.BatchId, request.ItemId);
 
-        // Create both files in parallel
+        // Create file content in parallel
         logger.LogInformation("[SFTP] Orchestration {id} — creating files...", id);
-        var personFileTask = context.CallActivityAsync<string>(nameof(CreatePersonFile),
+        var personContentTask = context.CallActivityAsync<string>(nameof(CreatePersonFile),
             new CreatePersonFileInput(id, request.Person));
-        var addressFileTask = context.CallActivityAsync<string>(nameof(CreateAddressFile),
+        var addressContentTask = context.CallActivityAsync<string>(nameof(CreateAddressFile),
             new CreateAddressFileInput(id, request.Address));
-        await Task.WhenAll(personFileTask, addressFileTask);
+        await Task.WhenAll(personContentTask, addressContentTask);
 
-        string personFilePath = personFileTask.Result;
-        string addressFilePath = addressFileTask.Result;
+        string personContent = personContentTask.Result;
+        string addressContent = addressContentTask.Result;
+
+        string personFileName = $"person_{id}.txt";
+        string addressFileName = $"address_{id}.txt";
 
         // Upload each file independently — a failure in one doesn't prevent the other
         var fileResults = new List<FileResult>();
@@ -65,27 +69,27 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         logger.LogInformation("[SFTP] Orchestration {id} — uploading person file to SFTP server...", id);
         try
         {
-            await context.CallActivityAsync<string>(nameof(UploadFile), personFilePath, UploadRetryOptions);
+            await context.CallActivityAsync<string>(nameof(UploadFile),
+                new UploadFileInput(personFileName, personContent), UploadRetryOptions);
             fileResults.Add(new FileResult(FileType.Person, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
             logger.LogError(ex, "[SFTP] Orchestration {id} — person file upload failed after retries.", id);
             fileResults.Add(new FileResult(FileType.Person, Succeeded: false, ErrorMessage: ex.Message));
-            await context.CallActivityAsync(nameof(CleanupTempFiles), new[] { personFilePath });
         }
 
         logger.LogInformation("[SFTP] Orchestration {id} — uploading address file to SFTP server...", id);
         try
         {
-            await context.CallActivityAsync<string>(nameof(UploadFile), addressFilePath, UploadRetryOptions);
+            await context.CallActivityAsync<string>(nameof(UploadFile),
+                new UploadFileInput(addressFileName, addressContent), UploadRetryOptions);
             fileResults.Add(new FileResult(FileType.Address, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
             logger.LogError(ex, "[SFTP] Orchestration {id} — address file upload failed after retries.", id);
             fileResults.Add(new FileResult(FileType.Address, Succeeded: false, ErrorMessage: ex.Message));
-            await context.CallActivityAsync(nameof(CleanupTempFiles), new[] { addressFilePath });
         }
 
         // Send callback to coordinator with per-file results.
@@ -105,7 +109,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         bool allSucceeded = fileResults.All(f => f.Succeeded);
         logger.LogInformation("[SFTP] Orchestration {id} — complete (allSucceeded={allSucceeded}).", id, allSucceeded);
         return allSucceeded
-            ? $"Uploaded 2 files: {Path.GetFileName(personFilePath)}, {Path.GetFileName(addressFilePath)}."
+            ? $"Uploaded 2 files: {personFileName}, {addressFileName}."
             : $"Partial failure: {string.Join(", ", fileResults.Where(f => !f.Succeeded).Select(f => f.FileType))}";
     }
 
@@ -113,77 +117,51 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
     public record CreatePersonFileInput(string InstanceId, PersonData Person);
     public record CreateAddressFileInput(string InstanceId, AddressData Address);
+    public record UploadFileInput(string FileName, string Content);
     public record SendCallbackInput(string CallbackUrl, SftpProcessResult Result);
 
     // --- Activities ---
 
-    /// <summary>Activity that writes person data to a temp file and returns the file path.</summary>
+    /// <summary>Activity that builds person data content and returns it as a string.</summary>
     [Function(nameof(CreatePersonFile))]
     public static string CreatePersonFile([ActivityTrigger] CreatePersonFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(CreatePersonFile));
         var person = input.Person;
 
-        string path = Path.Combine(Path.GetTempPath(), $"person_{input.InstanceId}.txt");
         string content = $"First Name: {person.FirstName}\nLast Name: {person.LastName}\nDate of Birth: {person.DateOfBirth}";
-        File.WriteAllText(path, content);
-        logger.LogInformation("[SFTP] Created person file at {path}.", path);
-        return path;
+        logger.LogInformation("[SFTP] Created person file content for {instanceId}.", input.InstanceId);
+        return content;
     }
 
-    /// <summary>Activity that writes address data to a temp file and returns the file path.</summary>
+    /// <summary>Activity that builds address data content and returns it as a string.</summary>
     [Function(nameof(CreateAddressFile))]
     public static string CreateAddressFile([ActivityTrigger] CreateAddressFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(CreateAddressFile));
         var address = input.Address;
 
-        string path = Path.Combine(Path.GetTempPath(), $"address_{input.InstanceId}.txt");
         string content = $"Street: {address.Street}\nCity: {address.City}\nState: {address.State}\nZip Code: {address.ZipCode}";
-        File.WriteAllText(path, content);
-        logger.LogInformation("[SFTP] Created address file at {path}.", path);
-        return path;
+        logger.LogInformation("[SFTP] Created address file content for {instanceId}.", input.InstanceId);
+        return content;
     }
 
-    /// <summary>Activity that connects to SFTP asynchronously, uploads a local file, and deletes the temp file.</summary>
+    /// <summary>Activity that connects to SFTP asynchronously and uploads file content from memory.</summary>
     [Function(nameof(UploadFile))]
-    public async Task<string> UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
+    public async Task<string> UploadFile([ActivityTrigger] UploadFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(UploadFile));
 
-        string fileName = Path.GetFileName(localPath);
-        string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
+        string remoteFilePath = $"{sftpClientFactory.RemotePath}/{input.FileName}";
 
         using var client = await sftpClientFactory.CreateConnectedClientAsync();
         logger.LogInformation("[SFTP] Connected to SFTP server.");
 
-        using var fileStream = File.OpenRead(localPath);
-        client.UploadFile(fileStream, remoteFilePath);
-        logger.LogInformation("[SFTP] Uploaded {fileName} to {remote}.", fileName, remoteFilePath);
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(input.Content));
+        client.UploadFile(stream, remoteFilePath);
+        logger.LogInformation("[SFTP] Uploaded {fileName} to {remote}.", input.FileName, remoteFilePath);
 
-        try { File.Delete(localPath); }
-        catch (Exception ex) { logger.LogWarning(ex, "[SFTP] Failed to delete temp file {path}.", localPath); }
-
-        return $"Uploaded {fileName} to {remoteFilePath}.";
-    }
-
-    /// <summary>Activity that deletes temp files after a failed upload attempt.</summary>
-    [Function(nameof(CleanupTempFiles))]
-    public static void CleanupTempFiles([ActivityTrigger] string[] filePaths, FunctionContext executionContext)
-    {
-        ILogger logger = executionContext.GetLogger(nameof(CleanupTempFiles));
-        foreach (string path in filePaths)
-        {
-            try
-            {
-                if (File.Exists(path))
-                {
-                    File.Delete(path);
-                    logger.LogInformation("[SFTP] Cleaned up temp file {path}.", path);
-                }
-            }
-            catch (Exception ex) { logger.LogWarning(ex, "[SFTP] Failed to clean up temp file {path}.", path); }
-        }
+        return $"Uploaded {input.FileName} to {remoteFilePath}.";
     }
 
     /// <summary>Activity that POSTs the processing result back to the Coordinator's callback URL.</summary>

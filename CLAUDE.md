@@ -19,7 +19,7 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 **App 2: SFTP Processor** (`SftpProcessor.cs` + `SftpOrchestration.cs`)
 1. `ReceiveSftpRequest` (HTTP) — validates required fields, drops onto Storage Queue via `IMessageQueue`, returns 202
 2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}-{itemId}`)
-3. `SftpOrchestration` (Orchestrator) — creates person + address files in parallel, uploads each independently with retry (per-file try/catch), sends callback with `List<FileResult>`. Callback failure is isolated — files stay uploaded even if callback fails
+3. `SftpOrchestration` (Orchestrator) — generates person + address file content in parallel, uploads each to SFTP from memory with retry (per-file try/catch), sends callback with `List<FileResult>`. Callback failure is isolated — files stay uploaded even if callback fails
 
 **Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Three entity levels: batch (PK: "batch"), item (PK: batchId, RK: itemId), and file (PK: batchId, RK: `{itemId}_{fileType}`). Item status is derived from its file statuses via `UpdateItemFromFilesAsync`. Batch completion is based on file count. Entity creation is idempotent (409 Conflict ignored). Batch completion is race-safe (status guard + ETag/412 catch).
 
