@@ -6,7 +6,7 @@
     <OutputType>Exe</OutputType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RootNamespace>az_functions</RootNamespace>
+    <RootNamespace>AzFunctions</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>

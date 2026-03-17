@@ -1,7 +1,7 @@
 using Azure;
 using Azure.Data.Tables;
 
-namespace Company.Function;
+namespace AzFunctions;
 
 public interface IBatchTracker
 {
@@ -22,7 +22,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
     {
         var entity = new TableEntity("batch", batchId)
         {
-            ["Status"] = "Processing",
+            ["Status"] = BatchStatus.Processing,
             ["ItemCount"] = itemCount,
             ["CreatedAt"] = DateTimeOffset.UtcNow
         };
@@ -33,7 +33,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
     {
         var entity = new TableEntity(batchId, itemId)
         {
-            ["Status"] = "Queued",
+            ["Status"] = BatchStatus.Queued,
             ["CreatedAt"] = DateTimeOffset.UtcNow
         };
         await tableClient.AddEntityAsync(entity);
@@ -53,7 +53,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         }
 
         // Already completed — idempotent
-        if (entity.GetString("Status") == "Completed")
+        if (entity.GetString("Status") == BatchStatus.Completed)
             return;
 
         entity["Status"] = status;
@@ -75,7 +75,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
             filter: $"PartitionKey eq '{batchId}'"))
         {
             string status = item.GetString("Status") ?? "";
-            if (status is "Completed" or "Failed")
+            if (status is BatchStatus.Completed or BatchStatus.Failed)
                 completedCount++;
         }
 
@@ -92,14 +92,14 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         await foreach (var item in tableClient.QueryAsync<TableEntity>(
             filter: $"PartitionKey eq '{batchId}'"))
         {
-            if (item.GetString("Status") == "Failed")
+            if (item.GetString("Status") == BatchStatus.Failed)
             {
                 hasFailures = true;
                 break;
             }
         }
 
-        entity["Status"] = hasFailures ? "PartialFailure" : "Completed";
+        entity["Status"] = hasFailures ? BatchStatus.PartialFailure : BatchStatus.Completed;
         entity["CompletedAt"] = DateTimeOffset.UtcNow;
         await tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
     }

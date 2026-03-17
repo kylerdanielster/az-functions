@@ -6,7 +6,7 @@ using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 
-namespace Company.Function;
+namespace AzFunctions;
 
 public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker batchTracker)
 {
@@ -46,6 +46,82 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
             logger.LogError(ex, "[SFTP] Data feed failed.");
         }
     }
+
+    [Function(nameof(BatchItemCompleted))]
+    public async Task<HttpResponseData> BatchItemCompleted(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "batch/callback")] HttpRequestData req,
+        FunctionContext executionContext)
+    {
+        ILogger logger = executionContext.GetLogger(nameof(BatchItemCompleted));
+
+        var result = await req.ReadFromJsonAsync<SftpProcessResult>();
+        if (result is null)
+        {
+            var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
+            await badRequest.WriteStringAsync("Invalid or missing callback data.");
+            return badRequest;
+        }
+
+        string status = result.Succeeded ? BatchStatus.Completed : BatchStatus.Failed;
+        await batchTracker.UpdateItemStatusAsync(result.BatchId, result.ItemId, status, result.ErrorMessage);
+
+        logger.LogInformation("[SFTP] Callback received — batch {batchId}, item {itemId}, status={status}.",
+            result.BatchId, result.ItemId, status);
+
+        if (await batchTracker.IsBatchCompleteAsync(result.BatchId))
+        {
+            await batchTracker.CompleteBatchAsync(result.BatchId);
+
+            // TODO: Notify third party that batch payment processing is complete.
+            // This should call the third party's API to mark their payment records as completed.
+            logger.LogInformation("[SFTP] Batch {batchId} complete — would notify third party.", result.BatchId);
+        }
+
+        var response = req.CreateResponse(HttpStatusCode.OK);
+        await response.WriteAsJsonAsync(new { result.BatchId, result.ItemId, status });
+        return response;
+    }
+
+    private async Task<string> GenerateBatchAsync(ILogger logger)
+    {
+        string processorBaseUrl = Environment.GetEnvironmentVariable("PROCESSOR_BASE_URL")
+            ?? throw new InvalidOperationException("PROCESSOR_BASE_URL not configured.");
+        string coordinatorBaseUrl = Environment.GetEnvironmentVariable("COORDINATOR_BASE_URL")
+            ?? throw new InvalidOperationException("COORDINATOR_BASE_URL not configured.");
+
+        string batchId = Guid.NewGuid().ToString("N")[..8];
+        string callbackUrl = $"{coordinatorBaseUrl}/api/batch/callback";
+
+        logger.LogInformation("[SFTP] Data feed starting — batch {batchId} with {count} items.",
+            batchId, BatchSize);
+
+        await batchTracker.CreateBatchAsync(batchId, BatchSize);
+
+        using var httpClient = httpClientFactory.CreateClient();
+
+        for (int i = 0; i < BatchSize; i++)
+        {
+            string itemId = $"item-{i:D3}";
+            var person = PersonFaker.Generate();
+            var address = AddressFaker.Generate();
+
+            var request = new SftpProcessRequest(batchId, itemId, person, address, callbackUrl);
+
+            await batchTracker.CreateItemAsync(batchId, itemId);
+
+            var response = await httpClient.PostAsJsonAsync(
+                $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
+            response.EnsureSuccessStatusCode();
+
+            logger.LogInformation("[SFTP] Batch {batchId} — item {itemId} queued ({first} {last}).",
+                batchId, itemId, person.FirstName, person.LastName);
+        }
+
+        logger.LogInformation("[SFTP] Data feed batch {batchId} — all {count} items submitted.", batchId, BatchSize);
+        return batchId;
+    }
+
+    // --- Testing / Verification Endpoints ---
 
     // Testing: HTTP trigger that returns batchId (used by E2E test script)
     [Function(nameof(TriggerDataFeed))]
@@ -114,76 +190,5 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         var response = req.CreateResponse(HttpStatusCode.OK);
         await response.WriteAsJsonAsync(new { deleted = count });
         return response;
-    }
-
-    [Function(nameof(BatchItemCompleted))]
-    public async Task<HttpResponseData> BatchItemCompleted(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "batch/callback")] HttpRequestData req,
-        FunctionContext executionContext)
-    {
-        ILogger logger = executionContext.GetLogger(nameof(BatchItemCompleted));
-
-        var result = await req.ReadFromJsonAsync<SftpProcessResult>();
-        if (result is null)
-        {
-            var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
-            await badRequest.WriteStringAsync("Invalid or missing callback data.");
-            return badRequest;
-        }
-
-        string status = result.Succeeded ? "Completed" : "Failed";
-        await batchTracker.UpdateItemStatusAsync(result.BatchId, result.ItemId, status, result.ErrorMessage);
-
-        logger.LogInformation("[SFTP] Callback received — batch {batchId}, item {itemId}, status={status}.",
-            result.BatchId, result.ItemId, status);
-
-        if (await batchTracker.IsBatchCompleteAsync(result.BatchId))
-        {
-            await batchTracker.CompleteBatchAsync(result.BatchId);
-            logger.LogInformation("[SFTP] Batch {batchId} complete — would notify third party.", result.BatchId);
-        }
-
-        var response = req.CreateResponse(HttpStatusCode.OK);
-        await response.WriteAsJsonAsync(new { result.BatchId, result.ItemId, status });
-        return response;
-    }
-
-    private async Task<string> GenerateBatchAsync(ILogger logger)
-    {
-        string processorBaseUrl = Environment.GetEnvironmentVariable("PROCESSOR_BASE_URL")
-            ?? throw new InvalidOperationException("PROCESSOR_BASE_URL not configured.");
-        string coordinatorBaseUrl = Environment.GetEnvironmentVariable("COORDINATOR_BASE_URL")
-            ?? throw new InvalidOperationException("COORDINATOR_BASE_URL not configured.");
-
-        string batchId = Guid.NewGuid().ToString("N")[..8];
-        string callbackUrl = $"{coordinatorBaseUrl}/api/batch/callback";
-
-        logger.LogInformation("[SFTP] Data feed starting — batch {batchId} with {count} items.",
-            batchId, BatchSize);
-
-        await batchTracker.CreateBatchAsync(batchId, BatchSize);
-
-        using var httpClient = httpClientFactory.CreateClient();
-
-        for (int i = 0; i < BatchSize; i++)
-        {
-            string itemId = $"item-{i:D3}";
-            var person = PersonFaker.Generate();
-            var address = AddressFaker.Generate();
-
-            var request = new SftpProcessRequest(batchId, itemId, person, address, callbackUrl);
-
-            await batchTracker.CreateItemAsync(batchId, itemId);
-
-            var response = await httpClient.PostAsJsonAsync(
-                $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
-            response.EnsureSuccessStatusCode();
-
-            logger.LogInformation("[SFTP] Batch {batchId} — item {itemId} queued ({first} {last}).",
-                batchId, itemId, person.FirstName, person.LastName);
-        }
-
-        logger.LogInformation("[SFTP] Data feed batch {batchId} — all {count} items submitted.", batchId, BatchSize);
-        return batchId;
     }
 }

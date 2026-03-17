@@ -23,20 +23,12 @@ The primary test mechanism is `test-sftp-orchestration.sh`.
 ```
 
 The script:
-1. Generates fake data using `tools/generate-test-data`
-2. Starts an orchestration instance
-3. Sends person and address data
-4. Polls status until completion
-5. Verifies uploaded files on the SFTP server
+1. Cleans up previous test data (batch tracking + SFTP files)
+2. Triggers a batch of 10 items via `POST /api/datafeed/trigger`
+3. Polls batch status until all items complete
+4. Verifies 20 SFTP files uploaded (10 person + 10 address)
 
-### Test Data Generation
-
-```bash
-cd tools/generate-test-data
-dotnet run -- --person    # Generate person JSON
-dotnet run -- --address   # Generate address JSON
-dotnet run                # Generate both
-```
+> **Note:** `test-sftp-retry.sh` is stale — it references endpoints and tools from a previous architecture revision and will not work.
 
 ### Verifying SFTP Uploads
 

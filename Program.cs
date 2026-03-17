@@ -1,5 +1,6 @@
 using Azure.Data.Tables;
-using Company.Function;
+using Azure.Storage.Queues;
+using AzFunctions;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,6 +15,8 @@ builder.Services
     .AddApplicationInsightsTelemetryWorkerService()
     .ConfigureFunctionsApplicationInsights();
 
+builder.Services.AddSingleton<ISftpClientFactory, SftpClientFactory>();
+
 builder.Services.AddSingleton<IBatchTracker>(sp =>
 {
     string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
@@ -21,6 +24,18 @@ builder.Services.AddSingleton<IBatchTracker>(sp =>
     var tableClient = new TableClient(connectionString, "BatchTracking");
     tableClient.CreateIfNotExists();
     return new TableBatchTracker(tableClient);
+});
+
+builder.Services.AddSingleton(sp =>
+{
+    string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
+        ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
+    var queueClient = new QueueClient(connectionString, SftpProcessor.QueueName, new QueueClientOptions
+    {
+        MessageEncoding = QueueMessageEncoding.Base64
+    });
+    queueClient.CreateIfNotExists();
+    return queueClient;
 });
 
 var app = builder.Build();

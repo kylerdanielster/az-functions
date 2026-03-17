@@ -7,9 +7,9 @@ using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
 
-namespace Company.Function;
+namespace AzFunctions;
 
-public static class SftpProcessor
+public class SftpProcessor(QueueClient queueClient)
 {
     public const string QueueName = "sftp-processing-queue";
 
@@ -19,7 +19,7 @@ public static class SftpProcessor
     };
 
     [Function(nameof(ReceiveSftpRequest))]
-    public static async Task<HttpResponseData> ReceiveSftpRequest(
+    public async Task<HttpResponseData> ReceiveSftpRequest(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "sftp/process")] HttpRequestData req,
         FunctionContext executionContext)
     {
@@ -33,15 +33,6 @@ public static class SftpProcessor
             return badRequest;
         }
 
-        string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
-            ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
-
-        var queueClient = new QueueClient(connectionString, QueueName, new QueueClientOptions
-        {
-            MessageEncoding = QueueMessageEncoding.Base64
-        });
-        await queueClient.CreateIfNotExistsAsync();
-
         string message = JsonSerializer.Serialize(request, JsonOptions);
         await queueClient.SendMessageAsync(message);
 
@@ -49,7 +40,7 @@ public static class SftpProcessor
             request.BatchId, request.ItemId);
 
         var response = req.CreateResponse(HttpStatusCode.Accepted);
-        await response.WriteAsJsonAsync(new { request.BatchId, request.ItemId, status = "Queued" });
+        await response.WriteAsJsonAsync(new { request.BatchId, request.ItemId, status = BatchStatus.Queued });
         return response;
     }
 

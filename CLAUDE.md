@@ -4,7 +4,7 @@ This file provides core guidance to Claude Code.
 
 ## Language & Toolchain
 
-C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP.
+C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP. Namespace: `AzFunctions`.
 
 ## Architecture
 
@@ -25,20 +25,26 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 
 **Storage**: All services (Table Storage, Queue, Durable Functions state) use the single `AzureWebJobsStorage` connection string. Locally → Azurite. In production → dedicated storage account separate from the function app's built-in storage.
 
-**SFTP**: SSH.NET (`Renci.SshNet`). Local server via OpenSSH Docker container (port 2222).
+**SFTP**: SSH.NET (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory`. Local server via OpenSSH Docker container (port 2222).
 
 **File layout**:
 ```
 Program.cs                    Entry point and DI configuration
-Models.cs                     Shared records (data, request/response, batch status)
+Models.cs                     Shared records, DTOs, and BatchStatus constants
 BatchTracking.cs              IBatchTracker interface + TableBatchTracker implementation
+SftpClientFactory.cs          ISftpClientFactory interface + SftpClientFactory implementation
 SftpProcessor.cs              HTTP receiver + queue trigger (App 2 entry points)
 SftpOrchestration.cs          Orchestrator, file creation/upload activities, callback, SFTP endpoints
 SftpDataFeed.cs               Timer/HTTP triggers, batch status, callback webhook (App 1)
 host.json                     Azure Functions, durable task, and queue config
 docker-compose.yml            Azurite + SFTP containers for local dev
 test-sftp-orchestration.sh    E2E test script
+test-sftp-retry.sh            Stale — references non-existent endpoints from a previous architecture
 ```
+
+## DI Pattern
+
+Use instance classes with constructor injection for Azure Function containers. The isolated worker model fully supports this pattern. Register dependencies in `Program.cs`. Keep orchestrator methods static (Durable Functions requirement) — activities and HTTP triggers are instance methods.
 
 ## AI Assistant Guidelines
 

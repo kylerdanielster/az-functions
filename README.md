@@ -60,46 +60,71 @@ The app runs on port 7071.
 
 ## Storage
 
-All Azure Storage services use the single `AzureWebJobsStorage` connection string:
+The POC uses a single `AzureWebJobsStorage` connection string for simplicity. In production, application data should be separated from infrastructure state:
 
-| Service | Purpose |
-|---|---|
-| **Table Storage** (`BatchTracking`) | Batch metadata and item status tracking |
-| **Queue Storage** (`sftp-processing-queue`) | Decouples HTTP acceptance from orchestration processing |
-| **Blob/Table** (Durable Functions) | Orchestration state, history, and checkpoints |
+| Service | POC | Production | Purpose |
+|---|---|---|---|
+| **Durable Functions** (blob/table) | `AzureWebJobsStorage` | `AzureWebJobsStorage` | Orchestration state, history, checkpoints — managed by the runtime |
+| **Table Storage** (`BatchTracking`) | `AzureWebJobsStorage` | Dedicated storage account | Batch metadata and item status tracking — application data |
+| **Queue Storage** (`sftp-processing-queue`) | `AzureWebJobsStorage` | Dedicated storage account | Decouples HTTP acceptance from orchestration — application data |
 
-Locally, this points to **Azurite** (`UseDevelopmentStorage=true`) on ports 10000 (blob), 10001 (queue), 10002 (table).
+**Why separate?** `AzureWebJobsStorage` is the function app's internal storage — it holds lease blobs, host IDs, durable task history, and other runtime state. Mixing application tables and queues into this account couples your data to the runtime's lifecycle and makes independent management (backup, scaling, access control) harder.
 
-In production, this should be a **dedicated storage account** separate from the function app's built-in storage, to isolate application data from infrastructure state.
+**Local development**: All services point to Azurite (`UseDevelopmentStorage=true`) on ports 10000 (blob), 10001 (queue), 10002 (table). No separation needed locally.
 
 ## Architecture
 
-Two logical apps (Coordinator + SFTP Processor) running in a single function app for the POC. Communication uses HTTP + Storage Queue + callback.
+In production, this will be two separate function apps. They are combined into a single app for this POC.
+
+- **App 1 — Coordinator** (`SftpDataFeed.cs`, `BatchTracking.cs`): Generates payment data, tracks batch progress, and notifies the third party when complete.
+- **App 2 — SFTP Processor** (`SftpProcessor.cs`, `SftpOrchestration.cs`): Receives individual payment items, creates files, uploads to SFTP, and calls back to App 1.
+
+Communication between the two apps is HTTP + callback. App 1 POSTs items to App 2 and receives completion callbacks asynchronously.
 
 ```
-App 1: Coordinator                          App 2: SFTP Processor
-─────────────────────                       ─────────────────────
-Function 1A: DataFeed (Timer)               Function 2A: ReceiveSftpRequest (HTTP)
-  1. Generate 10 fake payments (Bogus)        1. Accept POST with payments + callbackUrl
-  2. Create batch in Table Storage            2. Drop message onto Storage Queue
-  3. POST each item to App 2                  3. Return 202 Accepted immediately
-  4. Get 202 back, function exits
-                                            Function 2B: ProcessSftpQueue (Queue Trigger)
-Function 1B: BatchItemCompleted (HTTP)        1. Start Durable Functions orchestration
-  1. Receive callback { batchId, itemId }        (deterministic ID: sftp-{batchId}-{itemId})
-  2. Update item status in Table Storage
-  3. Query all items — all done?            SftpOrchestration (Orchestrator)
-  4. If yes → log "would notify 3rd party"    1. Parallel: CreatePersonFile + CreateAddressFile
-     + mark batch complete                    2. Parallel: UploadFile × 2 (with retry)
-  5. Return 200 OK                            3. SendCallback → POST to App 1's webhook
+Step 1: App 1 sends items to App 2
+──────────────────────────────────
+
+  RunDataFeed (Timer, daily)
+    1. Generate 10 fake payments (Bogus)
+    2. Create batch + items in Table Storage
+    3. POST each item to ReceiveSftpRequest
+    4. Get 202 back, function exits
+
+Step 2: App 2 processes each item
+─────────────────────────────────
+
+  ReceiveSftpRequest (HTTP POST /api/sftp/process)
+    1. Validate request
+    2. Drop message onto Storage Queue
+    3. Return 202 Accepted
+
+  ProcessSftpQueue (Queue Trigger)
+    1. Deserialize queue message
+    2. Start SftpOrchestration (deterministic ID: sftp-{batchId}-{itemId})
+
+  SftpOrchestration (Orchestrator)
+    1. CreatePersonFile + CreateAddressFile (parallel)
+    2. UploadFile x2 with retry (parallel)
+    3. SendCallback — POST result to App 1's callbackUrl
+
+Step 3: App 1 tracks completion
+───────────────────────────────
+
+  BatchItemCompleted (HTTP POST /api/batch/callback)
+    1. Update item status in Table Storage
+    2. Check if all items are done
+    3. If yes — mark batch complete + notify third party (TODO)
+    4. Return 200 OK
 ```
 
 ### Key design decisions
 
 - **Single-request flow**: No external events. Each item is a self-contained `SftpProcessRequest` with person data, address data, and callback URL.
 - **Deterministic instance IDs**: `sftp-{batchId}-{itemId}` prevents duplicate orchestrations from at-least-once queue delivery.
-- **No counters on batch entity**: Callback handler queries all items by batchId to check completion, avoiding race conditions from concurrent counter updates.
+- **No counters on batch entity**: `BatchItemCompleted` queries all items by batchId to check completion, avoiding race conditions from concurrent counter updates.
 - **Storage Queue**: Decouples HTTP acceptance from orchestration processing. Provides built-in retry with poison queue support.
+- **Callback-driven completion**: App 2 doesn't know about batches — it processes individual items and calls back with success/failure. App 1 aggregates results.
 
 ### Data model (Table Storage)
 
@@ -115,19 +140,26 @@ Item entity (`PartitionKey: "{batchId}"`, `RowKey: "{itemId}"`):
 
 ## Functions
 
+### Application
+
 | Function | Trigger | Description |
 |---|---|---|
 | `RunDataFeed` | Timer (daily) | Generates batch of 10 fake payments, creates batch in Table Storage, POSTs each to processor |
-| `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as RunDataFeed but returns `{ batchId }` — for testing and manual use |
-| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + all item statuses from Table Storage |
 | `BatchItemCompleted` | HTTP POST `/api/batch/callback` | Receives completion callbacks, updates Table Storage, detects batch completion |
-| `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in BatchTracking table (test cleanup) |
 | `ReceiveSftpRequest` | HTTP POST `/api/sftp/process` | Accepts processing request, drops onto Storage Queue, returns 202 |
 | `ProcessSftpQueue` | Queue `sftp-processing-queue` | Starts Durable Functions orchestration with deterministic instance ID |
 | `SftpOrchestration` | Orchestration | Creates files in parallel, uploads to SFTP with retry, sends callback |
+
+### Testing / Verification
+
+| Function | Trigger | Description |
+|---|---|---|
+| `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as RunDataFeed but returns `{ batchId }` — used by E2E test script |
+| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + all item statuses from Table Storage |
+| `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in BatchTracking table |
 | `SftpOrchestration_ListFiles` | HTTP GET `/api/sftp/files` | Lists files on the SFTP server |
 | `SftpOrchestration_GetFile` | HTTP GET `/api/sftp/files/{fileName}` | Returns the contents of a file from the SFTP server |
-| `SftpOrchestration_DeleteAllFiles` | HTTP DELETE `/api/sftp/files` | Deletes all files on SFTP server (test cleanup) |
+| `SftpOrchestration_DeleteAllFiles` | HTTP DELETE `/api/sftp/files` | Deletes all files on SFTP server |
 
 ## Data Feed
 
@@ -329,6 +361,8 @@ func start  # in another terminal
 ./test-sftp-orchestration.sh
 ```
 
+> **Note:** `test-sftp-retry.sh` is stale — it references endpoints and tools from a previous architecture revision and will not work. Use `test-sftp-orchestration.sh` for E2E testing.
+
 The script will:
 1. Clean up previous test data (batch tracking entities + SFTP files)
 2. Trigger a batch of 10 items and capture the batchId
@@ -363,7 +397,7 @@ Summary:
 
 ## SFTP via SSH.NET
 
-SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`). The `SftpClient` is used in three places within `SftpOrchestration.cs`:
+SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`) via `ISftpClientFactory`. The factory reads SFTP config from environment variables once at startup, validates the port, and creates connected `SftpClient` instances. It is used in `SftpOrchestration.cs` for:
 
 - **`UploadFile` activity** — uploads a single file with retry policy
 - **`ListFiles` HTTP trigger** — lists all files in the remote upload directory
@@ -377,7 +411,7 @@ SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`
 | `SFTP_PORT` | No | `22` | SFTP server port |
 | `SFTP_USERNAME` | Yes | — | Login username |
 | `SFTP_PASSWORD` | Yes | — | Login password |
-| `SFTP_REMOTE_PATH` | No | `/upload` | Remote directory for uploads |
+| `SFTP_REMOTE_PATH` | No | `/upload` | Remote directory for uploads (local dev uses `/config/upload` — see `local.settings.json`) |
 
 ## Docker Services
 

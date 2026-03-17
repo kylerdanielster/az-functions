@@ -17,7 +17,7 @@ These rules apply when editing `.cs` files.
 ## Types
 
 - Use `record` types for DTOs and data transfer objects
-- Use `static class` for Azure Function containers (no instance state)
+- Use instance classes with constructor injection for Azure Function containers (isolated worker supports DI)
 - Enable nullable reference types (`<Nullable>enable</Nullable>`)
 
 ## Null Handling

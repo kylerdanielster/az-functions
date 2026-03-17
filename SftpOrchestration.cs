@@ -4,14 +4,11 @@ using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
 using Microsoft.Extensions.Logging;
-using Renci.SshNet;
 
-namespace Company.Function;
+namespace AzFunctions;
 
-public static class SftpOrchestration
+public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory)
 {
-    private static readonly TimeSpan SftpTimeout = TimeSpan.FromSeconds(30);
-
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
         maxNumberOfAttempts: 3,
         firstRetryInterval: TimeSpan.FromSeconds(5)));
@@ -117,26 +114,15 @@ public static class SftpOrchestration
     }
 
     [Function(nameof(UploadFile))]
-    public static string UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
+    public string UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(UploadFile));
 
-        string host = Environment.GetEnvironmentVariable("SFTP_HOST")
-            ?? throw new InvalidOperationException("SFTP_HOST not configured.");
-        int port = int.Parse(Environment.GetEnvironmentVariable("SFTP_PORT") ?? "22");
-        string username = Environment.GetEnvironmentVariable("SFTP_USERNAME")
-            ?? throw new InvalidOperationException("SFTP_USERNAME not configured.");
-        string password = Environment.GetEnvironmentVariable("SFTP_PASSWORD")
-            ?? throw new InvalidOperationException("SFTP_PASSWORD not configured.");
-        string remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
-
         string fileName = Path.GetFileName(localPath);
-        string remoteFilePath = $"{remotePath}/{fileName}";
+        string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
 
-        using var client = new SftpClient(host, port, username, password);
-        client.OperationTimeout = SftpTimeout;
-        client.Connect();
-        logger.LogInformation("[SFTP] Connected to SFTP server {host}:{port}.", host, port);
+        using var client = sftpClientFactory.CreateConnectedClient();
+        logger.LogInformation("[SFTP] Connected to SFTP server.");
 
         using var fileStream = File.OpenRead(localPath);
         client.UploadFile(fileStream, remoteFilePath);
@@ -167,11 +153,11 @@ public static class SftpOrchestration
     }
 
     [Function(nameof(SendCallback))]
-    public static async Task SendCallback([ActivityTrigger] SendCallbackInput input, FunctionContext executionContext)
+    public async Task SendCallback([ActivityTrigger] SendCallbackInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(SendCallback));
 
-        using var httpClient = new HttpClient();
+        using var httpClient = httpClientFactory.CreateClient();
         var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Result, JsonOptions);
         response.EnsureSuccessStatusCode();
 
@@ -183,32 +169,21 @@ public static class SftpOrchestration
 
     // Testing: deletes all SFTP files (used by E2E test script)
     [Function("SftpOrchestration_DeleteAllFiles")]
-    public static async Task<HttpResponseData> DeleteAllFiles(
+    public async Task<HttpResponseData> DeleteAllFiles(
         [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "sftp/files")] HttpRequestData req,
         FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger("SftpOrchestration_DeleteAllFiles");
 
-        string host = Environment.GetEnvironmentVariable("SFTP_HOST")
-            ?? throw new InvalidOperationException("SFTP_HOST not configured.");
-        int port = int.Parse(Environment.GetEnvironmentVariable("SFTP_PORT") ?? "22");
-        string username = Environment.GetEnvironmentVariable("SFTP_USERNAME")
-            ?? throw new InvalidOperationException("SFTP_USERNAME not configured.");
-        string password = Environment.GetEnvironmentVariable("SFTP_PASSWORD")
-            ?? throw new InvalidOperationException("SFTP_PASSWORD not configured.");
-        string remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
+        using var client = sftpClientFactory.CreateConnectedClient();
 
-        using var client = new SftpClient(host, port, username, password);
-        client.OperationTimeout = SftpTimeout;
-        client.Connect();
-
-        var files = client.ListDirectory(remotePath)
+        var files = client.ListDirectory(sftpClientFactory.RemotePath)
             .Where(f => !f.IsDirectory)
             .ToList();
 
         foreach (var file in files)
         {
-            client.DeleteFile($"{remotePath}/{file.Name}");
+            client.DeleteFile($"{sftpClientFactory.RemotePath}/{file.Name}");
         }
 
         logger.LogInformation("[SFTP] Deleted {count} files from SFTP server.", files.Count);
@@ -219,26 +194,15 @@ public static class SftpOrchestration
     }
 
     [Function("SftpOrchestration_ListFiles")]
-    public static async Task<HttpResponseData> ListFiles(
+    public async Task<HttpResponseData> ListFiles(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files")] HttpRequestData req,
         FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger("SftpOrchestration_ListFiles");
 
-        string host = Environment.GetEnvironmentVariable("SFTP_HOST")
-            ?? throw new InvalidOperationException("SFTP_HOST not configured.");
-        int port = int.Parse(Environment.GetEnvironmentVariable("SFTP_PORT") ?? "22");
-        string username = Environment.GetEnvironmentVariable("SFTP_USERNAME")
-            ?? throw new InvalidOperationException("SFTP_USERNAME not configured.");
-        string password = Environment.GetEnvironmentVariable("SFTP_PASSWORD")
-            ?? throw new InvalidOperationException("SFTP_PASSWORD not configured.");
-        string remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
+        using var client = sftpClientFactory.CreateConnectedClient();
 
-        using var client = new SftpClient(host, port, username, password);
-        client.OperationTimeout = SftpTimeout;
-        client.Connect();
-
-        var files = client.ListDirectory(remotePath)
+        var files = client.ListDirectory(sftpClientFactory.RemotePath)
             .Where(f => !f.IsDirectory)
             .Select(f => new { name = f.Name, size = f.Length, modified = f.LastWriteTime })
             .ToList();
@@ -251,7 +215,7 @@ public static class SftpOrchestration
     }
 
     [Function("SftpOrchestration_GetFile")]
-    public static async Task<HttpResponseData> GetFile(
+    public async Task<HttpResponseData> GetFile(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files/{fileName}")] HttpRequestData req,
         string fileName,
         FunctionContext executionContext)
@@ -265,20 +229,9 @@ public static class SftpOrchestration
             return badRequest;
         }
 
-        string host = Environment.GetEnvironmentVariable("SFTP_HOST")
-            ?? throw new InvalidOperationException("SFTP_HOST not configured.");
-        int port = int.Parse(Environment.GetEnvironmentVariable("SFTP_PORT") ?? "22");
-        string username = Environment.GetEnvironmentVariable("SFTP_USERNAME")
-            ?? throw new InvalidOperationException("SFTP_USERNAME not configured.");
-        string password = Environment.GetEnvironmentVariable("SFTP_PASSWORD")
-            ?? throw new InvalidOperationException("SFTP_PASSWORD not configured.");
-        string remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
+        string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
 
-        string remoteFilePath = $"{remotePath}/{fileName}";
-
-        using var client = new SftpClient(host, port, username, password);
-        client.OperationTimeout = SftpTimeout;
-        client.Connect();
+        using var client = sftpClientFactory.CreateConnectedClient();
 
         if (!client.Exists(remoteFilePath))
         {

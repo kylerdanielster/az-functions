@@ -263,5 +263,6 @@ paket-files/
 __pycache__/
 *.pyc
 
-# SFTP test data
-sftp-data/.azurite/
+# Local dev data directories
+.azurite/
+sftp-data/
