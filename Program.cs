@@ -26,7 +26,7 @@ builder.Services.AddSingleton<IBatchTracker>(sp =>
     return new TableBatchTracker(tableClient);
 });
 
-builder.Services.AddSingleton(sp =>
+builder.Services.AddSingleton<IMessageQueue>(sp =>
 {
     string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
         ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
@@ -35,7 +35,7 @@ builder.Services.AddSingleton(sp =>
         MessageEncoding = QueueMessageEncoding.Base64
     });
     queueClient.CreateIfNotExists();
-    return queueClient;
+    return new StorageQueueClient(queueClient);
 });
 
 var app = builder.Build();

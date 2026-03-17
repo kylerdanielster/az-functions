@@ -10,13 +10,30 @@ namespace AzFunctions;
 /// </summary>
 public interface IBatchTracker
 {
+    /// <summary>Creates a batch entity. Idempotent — ignores 409 Conflict if entity already exists.</summary>
     Task CreateBatchAsync(string batchId, int itemCount);
+
+    /// <summary>Creates an item entity. Idempotent — ignores 409 Conflict if entity already exists.</summary>
     Task CreateItemAsync(string batchId, string itemId);
+
+    /// <summary>Creates a file entity. Idempotent — ignores 409 Conflict if entity already exists.</summary>
     Task CreateFileAsync(string batchId, string itemId, string fileType);
+
+    /// <summary>Updates a file entity's status. Idempotent — skips if already terminal or not found.</summary>
     Task UpdateFileStatusAsync(string batchId, string itemId, string fileType, string status, string? errorMessage = null);
+
+    /// <summary>Derives item status from its file statuses. No-op if files are still in progress.</summary>
     Task UpdateItemFromFilesAsync(string batchId, string itemId);
+
+    /// <summary>Returns true if all files in the batch have reached a terminal status.</summary>
     Task<bool> IsBatchCompleteAsync(string batchId);
-    Task CompleteBatchAsync(string batchId);
+
+    /// <summary>
+    /// Marks a batch as Completed or PartialFailure. Race-safe: returns false if
+    /// the batch is already terminal or another thread won the ETag race (412 Conflict).
+    /// </summary>
+    Task<bool> CompleteBatchAsync(string batchId);
+
     // Testing: query and cleanup methods used by test endpoints
     Task<TableEntity?> GetBatchAsync(string batchId);
     Task<List<TableEntity>> GetBatchItemsAsync(string batchId);
@@ -42,7 +59,14 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
             ["FileCount"] = itemCount * 2,
             ["CreatedAt"] = DateTimeOffset.UtcNow
         };
-        await tableClient.AddEntityAsync(entity);
+        try
+        {
+            await tableClient.AddEntityAsync(entity);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 409)
+        {
+            // Entity already exists — idempotent, no action needed
+        }
     }
 
     public async Task CreateItemAsync(string batchId, string itemId)
@@ -52,7 +76,14 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
             ["Status"] = BatchStatus.Queued,
             ["CreatedAt"] = DateTimeOffset.UtcNow
         };
-        await tableClient.AddEntityAsync(entity);
+        try
+        {
+            await tableClient.AddEntityAsync(entity);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 409)
+        {
+            // Entity already exists — idempotent, no action needed
+        }
     }
 
     public async Task CreateFileAsync(string batchId, string itemId, string fileType)
@@ -64,7 +95,14 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
             ["Status"] = BatchStatus.Queued,
             ["CreatedAt"] = DateTimeOffset.UtcNow
         };
-        await tableClient.AddEntityAsync(entity);
+        try
+        {
+            await tableClient.AddEntityAsync(entity);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 409)
+        {
+            // Entity already exists — idempotent, no action needed
+        }
     }
 
     public async Task UpdateFileStatusAsync(string batchId, string itemId, string fileType, string status, string? errorMessage = null)
@@ -163,10 +201,15 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         return completedFileCount >= fileCount;
     }
 
-    public async Task CompleteBatchAsync(string batchId)
+    public async Task<bool> CompleteBatchAsync(string batchId)
     {
         var response = await tableClient.GetEntityAsync<TableEntity>("batch", batchId);
         var entity = response.Value;
+
+        // Already terminal — another thread completed the batch first
+        string currentStatus = entity.GetString("Status") ?? "";
+        if (currentStatus is BatchStatus.Completed or BatchStatus.PartialFailure)
+            return false;
 
         // Check if any files failed
         bool hasFailures = false;
@@ -182,7 +225,17 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
 
         entity["Status"] = hasFailures ? BatchStatus.PartialFailure : BatchStatus.Completed;
         entity["CompletedAt"] = DateTimeOffset.UtcNow;
-        await tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
+
+        try
+        {
+            await tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
+            return true;
+        }
+        catch (RequestFailedException ex) when (ex.Status == 412)
+        {
+            // ETag conflict — another thread won the race
+            return false;
+        }
     }
 
     // Testing: query and cleanup methods used by test endpoints

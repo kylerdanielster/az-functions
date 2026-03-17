@@ -17,15 +17,15 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)
 
 **App 2: SFTP Processor** (`SftpProcessor.cs` + `SftpOrchestration.cs`)
-1. `ReceiveSftpRequest` (HTTP) — accepts POST with payments + callbackUrl, drops onto Storage Queue, returns 202
+1. `ReceiveSftpRequest` (HTTP) — validates required fields, drops onto Storage Queue via `IMessageQueue`, returns 202
 2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}-{itemId}`)
-3. `SftpOrchestration` (Orchestrator) — creates person + address files in parallel, uploads each independently with retry (per-file try/catch), sends callback with `List<FileResult>`
+3. `SftpOrchestration` (Orchestrator) — creates person + address files in parallel, uploads each independently with retry (per-file try/catch), sends callback with `List<FileResult>`. Callback failure is isolated — files stay uploaded even if callback fails
 
-**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Three entity levels: batch (PK: "batch"), item (PK: batchId, RK: itemId), and file (PK: batchId, RK: `{itemId}_{fileType}`). Item status is derived from its file statuses via `UpdateItemFromFilesAsync`. Batch completion is based on file count.
+**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Three entity levels: batch (PK: "batch"), item (PK: batchId, RK: itemId), and file (PK: batchId, RK: `{itemId}_{fileType}`). Item status is derived from its file statuses via `UpdateItemFromFilesAsync`. Batch completion is based on file count. Entity creation is idempotent (409 Conflict ignored). Batch completion is race-safe (status guard + ETag/412 catch).
 
 **Storage**: All services (Table Storage, Queue, Durable Functions state) use the single `AzureWebJobsStorage` connection string. Locally → Azurite. In production → dedicated storage account separate from the function app's built-in storage.
 
-**SFTP**: SSH.NET (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory`. Local server via OpenSSH Docker container (port 2222).
+**SFTP**: SSH.NET (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory`. Connections are async (`ConnectAsync`). Each activity creates a new connection — pooling is not feasible across Durable Functions activities. Local server via OpenSSH Docker container (port 2222).
 
 **File layout**:
 ```
@@ -33,6 +33,7 @@ Program.cs                    Entry point and DI configuration
 Models.cs                     Shared records, DTOs, and BatchStatus constants
 BatchTracking.cs              IBatchTracker interface + TableBatchTracker implementation
 SftpClientFactory.cs          ISftpClientFactory interface + SftpClientFactory implementation
+MessageQueue.cs               IMessageQueue interface + StorageQueueClient implementation
 SftpProcessor.cs              HTTP receiver + queue trigger (App 2 entry points)
 SftpOrchestration.cs          Orchestrator, file creation/upload activities, callback, SFTP endpoints
 SftpDataFeed.cs               Timer/HTTP triggers, batch status, callback webhook (App 1)
@@ -40,6 +41,7 @@ host.json                     Azure Functions, durable task, and queue config
 docker-compose.yml            Azurite + SFTP containers for local dev
 test-sftp-orchestration.sh    E2E test script
 test-sftp-retry.sh            Stale — references non-existent endpoints from a previous architecture
+tests/AzFunctions.Tests/      xUnit + NSubstitute unit tests (see Testing section)
 ```
 
 ## DI Pattern
@@ -82,11 +84,34 @@ rg --files -g "*.cs"
 ## Build Commands
 
 ```bash
-dotnet build          # build the project
+dotnet build          # build the main project
 dotnet restore        # restore NuGet packages
 func start            # run locally (requires Docker services)
 docker compose up -d  # start Azurite + SFTP containers
 ```
+
+## Testing
+
+**Unit tests** (`tests/AzFunctions.Tests/`): xUnit + NSubstitute, targeting net10.0.
+
+```bash
+dotnet test tests/AzFunctions.Tests/  # run unit tests
+dotnet test tests/AzFunctions.Tests/ --collect:"XPlat Code Coverage"  # with coverage
+```
+
+Test files:
+- `ReceiveSftpRequestTests.cs` — input validation (null body, missing fields, valid request)
+- `BatchCompletionTests.cs` — race-safe completion (happy path, already-completed, concurrent race)
+- `BatchItemCompletedTests.cs` — callback handling (file updates, batch completion, race-lost)
+- `GenerateBatchTests.cs` — batch submission (all succeed, mid-batch failure, all fail)
+- `SftpOrchestrationTests.cs` — orchestrator error isolation (callback failure, single file failure)
+- `Helpers/` — `FakeHttpRequestData`, `FakeHttpResponseData`, `FakeFunctionContext` for Azure Functions isolated worker model
+
+Tests mock `IBatchTracker`, `IMessageQueue`, `ISftpClientFactory`, and `IHttpClientFactory`. `TableBatchTracker` is tested via E2E against Azurite (not unit-tested — `TableClient` has no interface).
+
+**E2E tests**: `./test-sftp-orchestration.sh` (requires Docker services + `func start`).
+
+**Coverage**: Unit tests cover business logic callers (validation, error handling, race conditions). Infrastructure classes (`TableBatchTracker`, `SftpClientFactory`, `StorageQueueClient`) are covered by E2E.
 
 ## Auto-Loaded Rules (`.claude/rules/`)
 

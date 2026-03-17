@@ -1,5 +1,4 @@
 using System.Net;
-using Azure.Storage.Queues;
 using System.Text.Json;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
@@ -10,10 +9,10 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// SFTP Processor (App 2) entry points. Accepts processing requests over HTTP,
-/// queues them for reliable delivery, and starts Durable Functions orchestrations.
+/// SFTP Processor (App 2) entry points. Validates and accepts processing requests over HTTP,
+/// queues them via <see cref="IMessageQueue"/> for reliable delivery, and starts Durable Functions orchestrations.
 /// </summary>
-public class SftpProcessor(QueueClient queueClient)
+public class SftpProcessor(IMessageQueue messageQueue)
 {
     public const string QueueName = "sftp-processing-queue";
 
@@ -23,7 +22,9 @@ public class SftpProcessor(QueueClient queueClient)
     };
 
     /// <summary>
-    /// Accepts an SFTP processing request, drops it onto a Storage Queue, and returns 202 Accepted.
+    /// Accepts an SFTP processing request, validates required fields, drops it onto a
+    /// Storage Queue, and returns 202 Accepted. Returns 400 if the body is null or
+    /// if BatchId, ItemId, CallbackUrl, Person, or Address are missing.
     /// Route: POST /api/sftp/process
     /// </summary>
     [Function(nameof(ReceiveSftpRequest))]
@@ -41,8 +42,19 @@ public class SftpProcessor(QueueClient queueClient)
             return badRequest;
         }
 
+        if (string.IsNullOrWhiteSpace(request.BatchId) ||
+            string.IsNullOrWhiteSpace(request.ItemId) ||
+            string.IsNullOrWhiteSpace(request.CallbackUrl) ||
+            request.Person is null ||
+            request.Address is null)
+        {
+            var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
+            await badRequest.WriteStringAsync("Missing required fields: BatchId, ItemId, CallbackUrl, Person, and Address are required.");
+            return badRequest;
+        }
+
         string message = JsonSerializer.Serialize(request, JsonOptions);
-        await queueClient.SendMessageAsync(message);
+        await messageQueue.SendMessageAsync(message);
 
         logger.LogInformation("[SFTP] Queued processing request for batch {batchId}, item {itemId}.",
             request.BatchId, request.ItemId);

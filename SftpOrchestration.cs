@@ -11,6 +11,7 @@ namespace AzFunctions;
 /// SFTP Processor (App 2) orchestration and activities. Creates person/address files,
 /// uploads each independently to the SFTP server with retry (per-file error isolation),
 /// and sends a completion callback with per-file results to the Coordinator.
+/// Callback failure is isolated from file uploads — see <see cref="RunOrchestrator"/>.
 /// </summary>
 public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory)
 {
@@ -31,6 +32,8 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     /// Durable Functions orchestrator. Creates person and address files in parallel,
     /// then uploads each independently to SFTP with retry. Each file has its own try/catch
     /// so a failure in one doesn't prevent the other. Sends a callback with per-file results.
+    /// Callback failure is isolated — if the callback fails after retries, the orchestration
+    /// still completes (files are already uploaded).
     /// </summary>
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
@@ -85,10 +88,19 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
             await context.CallActivityAsync(nameof(CleanupTempFiles), new[] { addressFilePath });
         }
 
-        // Send callback to coordinator with per-file results
+        // Send callback to coordinator with per-file results.
+        // Callback failure is isolated — files are already uploaded successfully.
         var result = new SftpProcessResult(request.BatchId, request.ItemId, fileResults);
-        await context.CallActivityAsync(nameof(SendCallback),
-            new SendCallbackInput(request.CallbackUrl, result), CallbackRetryOptions);
+        try
+        {
+            await context.CallActivityAsync(nameof(SendCallback),
+                new SendCallbackInput(request.CallbackUrl, result), CallbackRetryOptions);
+        }
+        catch (TaskFailedException ex)
+        {
+            logger.LogError(ex, "[SFTP] Orchestration {id} — callback to {url} failed after retries. Files are uploaded but Coordinator was not notified.",
+                id, request.CallbackUrl);
+        }
 
         bool allSucceeded = fileResults.All(f => f.Succeeded);
         logger.LogInformation("[SFTP] Orchestration {id} — complete (allSucceeded={allSucceeded}).", id, allSucceeded);
@@ -133,16 +145,16 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return path;
     }
 
-    /// <summary>Activity that uploads a local file to the SFTP server and deletes the temp file.</summary>
+    /// <summary>Activity that connects to SFTP asynchronously, uploads a local file, and deletes the temp file.</summary>
     [Function(nameof(UploadFile))]
-    public string UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
+    public async Task<string> UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(UploadFile));
 
         string fileName = Path.GetFileName(localPath);
         string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
 
-        using var client = sftpClientFactory.CreateConnectedClient();
+        using var client = await sftpClientFactory.CreateConnectedClientAsync();
         logger.LogInformation("[SFTP] Connected to SFTP server.");
 
         using var fileStream = File.OpenRead(localPath);
@@ -202,7 +214,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     {
         ILogger logger = executionContext.GetLogger("SftpOrchestration_DeleteAllFiles");
 
-        using var client = sftpClientFactory.CreateConnectedClient();
+        using var client = await sftpClientFactory.CreateConnectedClientAsync();
 
         var files = client.ListDirectory(sftpClientFactory.RemotePath)
             .Where(f => !f.IsDirectory)
@@ -231,7 +243,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     {
         ILogger logger = executionContext.GetLogger("SftpOrchestration_ListFiles");
 
-        using var client = sftpClientFactory.CreateConnectedClient();
+        using var client = await sftpClientFactory.CreateConnectedClientAsync();
 
         var files = client.ListDirectory(sftpClientFactory.RemotePath)
             .Where(f => !f.IsDirectory)
@@ -266,7 +278,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
         string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
 
-        using var client = sftpClientFactory.CreateConnectedClient();
+        using var client = await sftpClientFactory.CreateConnectedClientAsync();
 
         if (!client.Exists(remoteFilePath))
         {

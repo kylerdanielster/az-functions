@@ -5,11 +5,13 @@ namespace AzFunctions;
 /// <summary>
 /// Creates connected SFTP clients using configuration from environment variables.
 /// Used by the SFTP Processor (App 2) for file upload and server inspection.
+/// Each call creates a new connection — connection pooling is not feasible because
+/// Durable Functions activities may run on different machines.
 /// </summary>
 public interface ISftpClientFactory
 {
     string RemotePath { get; }
-    SftpClient CreateConnectedClient();
+    Task<SftpClient> CreateConnectedClientAsync();
 }
 
 /// <summary>
@@ -45,11 +47,11 @@ public class SftpClientFactory : ISftpClientFactory
         remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
     }
 
-    public SftpClient CreateConnectedClient()
+    public async Task<SftpClient> CreateConnectedClientAsync()
     {
         var client = new SftpClient(host, port, username, password);
         client.OperationTimeout = SftpTimeout;
-        client.Connect();
+        await client.ConnectAsync(CancellationToken.None);
         return client;
     }
 }

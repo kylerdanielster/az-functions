@@ -55,9 +55,21 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
     }
 
+    // TODO: Callback failure resilience
+    // Problem: If SftpOrchestration.SendCallback fails after retries, the Coordinator never
+    // receives the callback and the batch stays stuck in "Processing" forever.
+    // Potential solutions:
+    //   1. Reconciliation timer that periodically queries Durable Functions orchestration status
+    //      for stuck batches and replays missed callbacks.
+    //   2. Simple timeout that marks batches stuck in "Processing" beyond a threshold as "Failed".
+    // Status: Research required — needs investigation into Durable Functions client API for
+    // querying orchestration output by instance ID pattern (sftp-{batchId}-*).
+
     /// <summary>
     /// Callback webhook that receives per-file completion results from the SFTP Processor.
     /// Updates file statuses, derives item status, and detects when the entire batch is done.
+    /// Batch completion is race-safe — only one concurrent callback will trigger the
+    /// completion notification via <see cref="IBatchTracker.CompleteBatchAsync"/>.
     /// Route: POST /api/batch/callback
     /// </summary>
     [Function(nameof(BatchItemCompleted))]
@@ -89,11 +101,13 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
 
         if (await batchTracker.IsBatchCompleteAsync(result.BatchId))
         {
-            await batchTracker.CompleteBatchAsync(result.BatchId);
-
-            // TODO: Notify third party that batch payment processing is complete.
-            // This should call the third party's API to mark their payment records as completed.
-            logger.LogInformation("[SFTP] Batch {batchId} complete — would notify third party.", result.BatchId);
+            bool wasCompleted = await batchTracker.CompleteBatchAsync(result.BatchId);
+            if (wasCompleted)
+            {
+                // TODO: Notify third party that batch payment processing is complete.
+                // This should call the third party's API to mark their payment records as completed.
+                logger.LogInformation("[SFTP] Batch {batchId} complete — would notify third party.", result.BatchId);
+            }
         }
 
         var response = req.CreateResponse(HttpStatusCode.OK);
@@ -104,6 +118,8 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
     /// <summary>
     /// Creates a batch with item and file entities in Table Storage, generates fake person/address pairs,
     /// and POSTs each item to the SFTP Processor. Returns the batch ID.
+    /// Handles partial submission failure: if an individual item fails to submit, its files are
+    /// marked as Failed and processing continues. If all items fail, the batch is completed immediately.
     /// </summary>
     private async Task<string> GenerateBatchAsync(ILogger logger)
     {
@@ -121,6 +137,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         await batchTracker.CreateBatchAsync(batchId, BatchSize);
 
         using var httpClient = httpClientFactory.CreateClient();
+        int submittedCount = 0;
 
         for (int i = 0; i < BatchSize; i++)
         {
@@ -134,15 +151,37 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
             await batchTracker.CreateFileAsync(batchId, itemId, FileType.Person);
             await batchTracker.CreateFileAsync(batchId, itemId, FileType.Address);
 
-            var response = await httpClient.PostAsJsonAsync(
-                $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
-            response.EnsureSuccessStatusCode();
+            try
+            {
+                var response = await httpClient.PostAsJsonAsync(
+                    $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
+                response.EnsureSuccessStatusCode();
+                submittedCount++;
 
-            logger.LogInformation("[SFTP] Batch {batchId} — item {itemId} queued ({first} {last}).",
-                batchId, itemId, person.FirstName, person.LastName);
+                logger.LogInformation("[SFTP] Batch {batchId} — item {itemId} queued ({first} {last}).",
+                    batchId, itemId, person.FirstName, person.LastName);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "[SFTP] Batch {batchId} — failed to submit item {itemId}.", batchId, itemId);
+
+                await batchTracker.UpdateFileStatusAsync(batchId, itemId, FileType.Person, BatchStatus.Failed, "Submission failed");
+                await batchTracker.UpdateFileStatusAsync(batchId, itemId, FileType.Address, BatchStatus.Failed, "Submission failed");
+                await batchTracker.UpdateItemFromFilesAsync(batchId, itemId);
+            }
         }
 
-        logger.LogInformation("[SFTP] Data feed batch {batchId} — all {count} items submitted.", batchId, BatchSize);
+        if (submittedCount == 0)
+        {
+            await batchTracker.CompleteBatchAsync(batchId);
+            logger.LogError("[SFTP] Batch {batchId} — all {count} items failed to submit.", batchId, BatchSize);
+        }
+        else
+        {
+            logger.LogInformation("[SFTP] Data feed batch {batchId} — {submitted}/{total} items submitted.",
+                batchId, submittedCount, BatchSize);
+        }
+
         return batchId;
     }
 
