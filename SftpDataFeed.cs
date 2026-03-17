@@ -8,6 +8,10 @@ using Microsoft.Extensions.Logging;
 
 namespace AzFunctions;
 
+/// <summary>
+/// Coordinator (App 1). Generates fake payment batches, submits items to the SFTP Processor,
+/// and receives completion callbacks to track batch progress.
+/// </summary>
 public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker batchTracker)
 {
     private const int BatchSize = 10;
@@ -30,6 +34,10 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
+    /// <summary>
+    /// Daily timer trigger that generates a batch of fake payments and submits each item
+    /// to the SFTP Processor for file creation and upload.
+    /// </summary>
     [Function(nameof(RunDataFeed))]
     public async Task RunDataFeed(
         [TimerTrigger("0 0 0 * * *")] TimerInfo timerInfo,
@@ -47,6 +55,11 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
     }
 
+    /// <summary>
+    /// Callback webhook that receives item-level completion notifications from the SFTP Processor.
+    /// Updates item status in Table Storage and detects when the entire batch is done.
+    /// Route: POST /api/batch/callback
+    /// </summary>
     [Function(nameof(BatchItemCompleted))]
     public async Task<HttpResponseData> BatchItemCompleted(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "batch/callback")] HttpRequestData req,

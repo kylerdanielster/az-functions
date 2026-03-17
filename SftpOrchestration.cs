@@ -7,6 +7,10 @@ using Microsoft.Extensions.Logging;
 
 namespace AzFunctions;
 
+/// <summary>
+/// SFTP Processor (App 2) orchestration and activities. Creates person/address files,
+/// uploads them to the SFTP server with retry, and sends a completion callback to the Coordinator.
+/// </summary>
 public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory)
 {
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
@@ -22,6 +26,10 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
+    /// <summary>
+    /// Durable Functions orchestrator. Creates person and address files in parallel,
+    /// uploads both to SFTP with retry, then sends a callback to the Coordinator with the result.
+    /// </summary>
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context)
@@ -87,6 +95,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
     // --- Activities ---
 
+    /// <summary>Activity that writes person data to a temp file and returns the file path.</summary>
     [Function(nameof(CreatePersonFile))]
     public static string CreatePersonFile([ActivityTrigger] CreatePersonFileInput input, FunctionContext executionContext)
     {
@@ -100,6 +109,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return path;
     }
 
+    /// <summary>Activity that writes address data to a temp file and returns the file path.</summary>
     [Function(nameof(CreateAddressFile))]
     public static string CreateAddressFile([ActivityTrigger] CreateAddressFileInput input, FunctionContext executionContext)
     {
@@ -113,6 +123,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return path;
     }
 
+    /// <summary>Activity that uploads a local file to the SFTP server and deletes the temp file.</summary>
     [Function(nameof(UploadFile))]
     public string UploadFile([ActivityTrigger] string localPath, FunctionContext executionContext)
     {
@@ -134,6 +145,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return $"Uploaded {fileName} to {remoteFilePath}.";
     }
 
+    /// <summary>Activity that deletes temp files after a failed upload attempt.</summary>
     [Function(nameof(CleanupTempFiles))]
     public static void CleanupTempFiles([ActivityTrigger] string[] filePaths, FunctionContext executionContext)
     {
@@ -152,6 +164,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         }
     }
 
+    /// <summary>Activity that POSTs the processing result back to the Coordinator's callback URL.</summary>
     [Function(nameof(SendCallback))]
     public async Task SendCallback([ActivityTrigger] SendCallbackInput input, FunctionContext executionContext)
     {

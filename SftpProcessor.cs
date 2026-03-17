@@ -9,6 +9,10 @@ using Microsoft.Extensions.Logging;
 
 namespace AzFunctions;
 
+/// <summary>
+/// SFTP Processor (App 2) entry points. Accepts processing requests over HTTP,
+/// queues them for reliable delivery, and starts Durable Functions orchestrations.
+/// </summary>
 public class SftpProcessor(QueueClient queueClient)
 {
     public const string QueueName = "sftp-processing-queue";
@@ -18,6 +22,10 @@ public class SftpProcessor(QueueClient queueClient)
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
+    /// <summary>
+    /// Accepts an SFTP processing request, drops it onto a Storage Queue, and returns 202 Accepted.
+    /// Route: POST /api/sftp/process
+    /// </summary>
     [Function(nameof(ReceiveSftpRequest))]
     public async Task<HttpResponseData> ReceiveSftpRequest(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "sftp/process")] HttpRequestData req,
@@ -44,6 +52,10 @@ public class SftpProcessor(QueueClient queueClient)
         return response;
     }
 
+    /// <summary>
+    /// Queue trigger that deserializes a processing request and starts an SftpOrchestration
+    /// with a deterministic instance ID (sftp-{batchId}-{itemId}) to prevent duplicates.
+    /// </summary>
     [Function(nameof(ProcessSftpQueue))]
     public static async Task ProcessSftpQueue(
         [QueueTrigger(QueueName)] string messageText,

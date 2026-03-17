@@ -2,12 +2,21 @@ using Renci.SshNet;
 
 namespace AzFunctions;
 
+/// <summary>
+/// Creates connected SFTP clients using configuration from environment variables.
+/// Used by the SFTP Processor (App 2) for file upload and server inspection.
+/// </summary>
 public interface ISftpClientFactory
 {
     string RemotePath { get; }
     SftpClient CreateConnectedClient();
 }
 
+/// <summary>
+/// Reads SFTP connection settings (host, port, username, password, remote path) from environment
+/// variables at startup and creates connected <see cref="SftpClient"/> instances on demand.
+/// Registered as a singleton in DI. Part of the SFTP Processor (App 2).
+/// </summary>
 public class SftpClientFactory : ISftpClientFactory
 {
     private static readonly TimeSpan SftpTimeout = TimeSpan.FromSeconds(30);

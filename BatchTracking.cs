@@ -3,6 +3,10 @@ using Azure.Data.Tables;
 
 namespace AzFunctions;
 
+/// <summary>
+/// Tracks batch and item status in Azure Table Storage.
+/// Used by the Coordinator (App 1) to manage batch lifecycle.
+/// </summary>
 public interface IBatchTracker
 {
     Task CreateBatchAsync(string batchId, int itemCount);
@@ -16,6 +20,12 @@ public interface IBatchTracker
     Task<int> ClearAllAsync();
 }
 
+/// <summary>
+/// Azure Table Storage implementation of <see cref="IBatchTracker"/>.
+/// Uses a single "BatchTracking" table with batch entities (PartitionKey: "batch")
+/// and item entities (PartitionKey: batchId).
+/// Part of the Coordinator (App 1).
+/// </summary>
 public class TableBatchTracker(TableClient tableClient) : IBatchTracker
 {
     public async Task CreateBatchAsync(string batchId, int itemCount)
