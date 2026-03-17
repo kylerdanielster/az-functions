@@ -56,8 +56,8 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
     }
 
     /// <summary>
-    /// Callback webhook that receives item-level completion notifications from the SFTP Processor.
-    /// Updates item status in Table Storage and detects when the entire batch is done.
+    /// Callback webhook that receives per-file completion results from the SFTP Processor.
+    /// Updates file statuses, derives item status, and detects when the entire batch is done.
     /// Route: POST /api/batch/callback
     /// </summary>
     [Function(nameof(BatchItemCompleted))]
@@ -75,11 +75,17 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
             return badRequest;
         }
 
-        string status = result.Succeeded ? BatchStatus.Completed : BatchStatus.Failed;
-        await batchTracker.UpdateItemStatusAsync(result.BatchId, result.ItemId, status, result.ErrorMessage);
+        // Update per-file statuses, then derive item status
+        foreach (var file in result.Files)
+        {
+            string fileStatus = file.Succeeded ? BatchStatus.Completed : BatchStatus.Failed;
+            await batchTracker.UpdateFileStatusAsync(result.BatchId, result.ItemId,
+                file.FileType, fileStatus, file.ErrorMessage);
+        }
+        await batchTracker.UpdateItemFromFilesAsync(result.BatchId, result.ItemId);
 
-        logger.LogInformation("[SFTP] Callback received — batch {batchId}, item {itemId}, status={status}.",
-            result.BatchId, result.ItemId, status);
+        logger.LogInformation("[SFTP] Callback received — batch {batchId}, item {itemId}, files={fileCount}.",
+            result.BatchId, result.ItemId, result.Files.Count);
 
         if (await batchTracker.IsBatchCompleteAsync(result.BatchId))
         {
@@ -91,12 +97,12 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
 
         var response = req.CreateResponse(HttpStatusCode.OK);
-        await response.WriteAsJsonAsync(new { result.BatchId, result.ItemId, status });
+        await response.WriteAsJsonAsync(new { result.BatchId, result.ItemId });
         return response;
     }
 
     /// <summary>
-    /// Creates a batch in Table Storage, generates fake person/address pairs,
+    /// Creates a batch with item and file entities in Table Storage, generates fake person/address pairs,
     /// and POSTs each item to the SFTP Processor. Returns the batch ID.
     /// </summary>
     private async Task<string> GenerateBatchAsync(ILogger logger)
@@ -125,6 +131,8 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
             var request = new SftpProcessRequest(batchId, itemId, person, address, callbackUrl);
 
             await batchTracker.CreateItemAsync(batchId, itemId);
+            await batchTracker.CreateFileAsync(batchId, itemId, FileType.Person);
+            await batchTracker.CreateFileAsync(batchId, itemId, FileType.Address);
 
             var response = await httpClient.PostAsJsonAsync(
                 $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
@@ -171,6 +179,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
 
         var items = await batchTracker.GetBatchItemsAsync(batchId);
+        var files = await batchTracker.GetBatchFilesAsync(batchId);
 
         var result = new BatchStatusResponse(
             BatchId: batchId,
@@ -186,6 +195,16 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
                     CompletedAt: i.GetDateTimeOffset("CompletedAt"),
                     ErrorMessage: i.GetString("ErrorMessage")))
                 .OrderBy(i => i.ItemId)
+                .ToList(),
+            Files: files
+                .Select(f => new BatchFileStatus(
+                    ItemId: f.GetString("ItemId") ?? "",
+                    FileType: f.GetString("FileType") ?? "",
+                    Status: f.GetString("Status") ?? "Unknown",
+                    CreatedAt: f.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue,
+                    CompletedAt: f.GetDateTimeOffset("CompletedAt"),
+                    ErrorMessage: f.GetString("ErrorMessage")))
+                .OrderBy(f => f.ItemId).ThenBy(f => f.FileType)
                 .ToList());
 
         var response = req.CreateResponse(HttpStatusCode.OK);

@@ -105,24 +105,27 @@ Step 2: App 2 processes each item
 
   SftpOrchestration (Orchestrator)
     1. CreatePersonFile + CreateAddressFile (parallel)
-    2. UploadFile x2 with retry (parallel)
-    3. SendCallback — POST result to App 1's callbackUrl
+    2. UploadFile for person (with retry, independent try/catch)
+    3. UploadFile for address (with retry, independent try/catch)
+    4. SendCallback — POST per-file results to App 1's callbackUrl
 
 Step 3: App 1 tracks completion
 ───────────────────────────────
 
   BatchItemCompleted (HTTP POST /api/batch/callback)
-    1. Update item status in Table Storage
-    2. Check if all items are done
-    3. If yes — mark batch complete + notify third party (TODO)
-    4. Return 200 OK
+    1. Update per-file statuses in Table Storage
+    2. Derive item status from its files
+    3. Check if all files are done
+    4. If yes — mark batch complete + notify third party (TODO)
+    5. Return 200 OK
 ```
 
 ### Key design decisions
 
 - **Single-request flow**: No external events. Each item is a self-contained `SftpProcessRequest` with person data, address data, and callback URL.
 - **Deterministic instance IDs**: `sftp-{batchId}-{itemId}` prevents duplicate orchestrations from at-least-once queue delivery.
-- **No counters on batch entity**: `BatchItemCompleted` queries all items by batchId to check completion, avoiding race conditions from concurrent counter updates.
+- **Per-file tracking**: Each batch item has separate file entities (person + address) in Table Storage. Item status is derived from its files. If one file fails, the other can still succeed.
+- **No counters on batch entity**: `BatchItemCompleted` queries all files by batchId to check completion, avoiding race conditions from concurrent counter updates.
 - **Storage Queue**: Decouples HTTP acceptance from orchestration processing. Provides built-in retry with poison queue support.
 - **Callback-driven completion**: App 2 doesn't know about batches — it processes individual items and calls back with success/failure. App 1 aggregates results.
 
@@ -132,9 +135,14 @@ Step 3: App 1 tracks completion
 
 Batch entity (`PartitionKey: "batch"`, `RowKey: "{batchId}"`):
 - Status: `Processing` | `Completed` | `PartialFailure`
-- ItemCount, CreatedAt, CompletedAt
+- ItemCount, FileCount (itemCount * 2), CreatedAt, CompletedAt
 
 Item entity (`PartitionKey: "{batchId}"`, `RowKey: "{itemId}"`):
+- Status: `Queued` | `Completed` | `Failed` (derived from file statuses)
+- CreatedAt, CompletedAt, ErrorMessage
+
+File entity (`PartitionKey: "{batchId}"`, `RowKey: "{itemId}_{fileType}"`):
+- ItemId, FileType (`person` | `address`)
 - Status: `Queued` | `Completed` | `Failed`
 - CreatedAt, CompletedAt, ErrorMessage
 
@@ -155,7 +163,7 @@ Item entity (`PartitionKey: "{batchId}"`, `RowKey: "{itemId}"`):
 | Function | Trigger | Description |
 |---|---|---|
 | `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as RunDataFeed but returns `{ batchId }` — used by E2E test script |
-| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + all item statuses from Table Storage |
+| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch, item, and file statuses from Table Storage |
 | `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in BatchTracking table |
 | `SftpOrchestration_ListFiles` | HTTP GET `/api/sftp/files` | Lists files on the SFTP server |
 | `SftpOrchestration_GetFile` | HTTP GET `/api/sftp/files/{fileName}` | Returns the contents of a file from the SFTP server |
@@ -168,10 +176,10 @@ The `SftpDataFeed` class (`SftpDataFeed.cs`) acts as the coordinator. It generat
 ### What it does
 
 1. Generates 10 random person + address pairs using Bogus
-2. Creates a batch entity and 10 item entities in Table Storage
+2. Creates a batch entity, 10 item entities, and 20 file entities in Table Storage
 3. POSTs each `SftpProcessRequest` to `POST /api/sftp/process`
 4. Each request includes a `callbackUrl` pointing to `/api/batch/callback`
-5. As callbacks arrive, updates item status and checks batch completion
+5. As callbacks arrive, updates per-file statuses, derives item status, and checks batch completion
 6. When all items complete, logs "would notify third party"
 
 ### Triggering manually
@@ -196,7 +204,7 @@ curl -X POST http://localhost:7071/admin/functions/RunDataFeed \
 ...
 [SFTP] Batch <batchId> — item item-009 queued (Jane Smith).
 [SFTP] Data feed batch <batchId> — all 10 items submitted.
-[SFTP] Callback received — batch <batchId>, item item-000, status=Completed.
+[SFTP] Callback received — batch <batchId>, item item-000, files=2.
 ...
 [SFTP] Batch <batchId> complete — would notify third party.
 ```
@@ -208,10 +216,11 @@ curl -X POST http://localhost:7071/admin/functions/RunDataFeed \
 The orchestration receives an `SftpProcessRequest` containing person data, address data, batch/item IDs, and a callback URL. It:
 
 1. Creates person and address files in parallel
-2. Uploads both files to SFTP in parallel (with retry policy: 3 attempts, 5s backoff)
-3. Sends a callback to the coordinator with the result
+2. Uploads person file to SFTP (with retry policy: 3 attempts, 5s backoff)
+3. Uploads address file to SFTP (with retry policy: 3 attempts, 5s backoff)
+4. Sends a callback to the coordinator with per-file results
 
-If upload fails after retries, the orchestration cleans up temp files and sends a failure callback.
+Each upload has its own try/catch — a failure in one file doesn't prevent the other from uploading. Failed files are cleaned up individually.
 
 ### Request flow
 
@@ -230,12 +239,11 @@ POST /api/sftp/process (SftpProcessRequest)
 CreatePersonFile  CreateAddressFile   (parallel)
   └─────┬─────┘
         ▼
-  ┌─────┴─────┐
-  ▼           ▼
-UploadFile    UploadFile              (parallel, with retry)
-  └─────┬─────┘
+  UploadFile (person, with retry + independent try/catch)
         ▼
-  SendCallback → POST /api/batch/callback
+  UploadFile (address, with retry + independent try/catch)
+        ▼
+  SendCallback → POST /api/batch/callback (per-file results)
 ```
 
 ### Request schema
@@ -265,18 +273,21 @@ UploadFile    UploadFile              (parallel, with retry)
 {
   "batchId": "string",
   "itemId": "string",
-  "succeeded": true,
-  "errorMessage": null
+  "files": [
+    { "fileType": "person", "succeeded": true, "errorMessage": null },
+    { "fileType": "address", "succeeded": true, "errorMessage": null }
+  ]
 }
 ```
 
 ### Error handling
 
-- **SFTP upload failure**: Activity retry policy (3 attempts, 5s backoff). If all fail, orchestration sends callback with `succeeded: false`.
+- **SFTP upload failure**: Activity retry policy (3 attempts, 5s backoff). Each file is uploaded independently — a person file failure doesn't prevent the address file from uploading.
 - **Queue delivery failure**: Azure retries up to 5x, then moves to `sftp-processing-queue-poison`.
 - **Callback failure**: `SendCallback` activity has its own retry policy (3 attempts, 5s backoff).
-- **Partial batch**: Each item is independent. Batch marked `PartialFailure` if any items failed.
-- **Idempotent callback**: Updating an already-completed item returns 200 without modification.
+- **Per-file tracking**: Each file has its own status entity. Item status is derived from its files (all files completed → item completed, any failed with none queued → item failed).
+- **Partial batch**: Each item is independent. Batch marked `PartialFailure` if any files failed.
+- **Idempotent callback**: Updating an already-terminal file status returns 200 without modification.
 - **Duplicate orchestration**: Deterministic instance ID (`sftp-{batchId}-{itemId}`) makes duplicate starts a no-op.
 
 ### Viewing files on the SFTP server
@@ -375,7 +386,7 @@ The script will:
 
 ```
 Step 1: Cleaning up previous test data...
-  Batch tracking: cleared 11 entities
+  Batch tracking: cleared 31 entities
   SFTP files: cleared 20 files
 
 Step 2: Triggering data feed...

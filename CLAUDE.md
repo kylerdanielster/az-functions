@@ -19,9 +19,9 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 **App 2: SFTP Processor** (`SftpProcessor.cs` + `SftpOrchestration.cs`)
 1. `ReceiveSftpRequest` (HTTP) — accepts POST with payments + callbackUrl, drops onto Storage Queue, returns 202
 2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}-{itemId}`)
-3. `SftpOrchestration` (Orchestrator) — creates person + address files in parallel, uploads to SFTP with retry, sends callback
+3. `SftpOrchestration` (Orchestrator) — creates person + address files in parallel, uploads each independently with retry (per-file try/catch), sends callback with `List<FileResult>`
 
-**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Batch entity + item entities per batch.
+**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Three entity levels: batch (PK: "batch"), item (PK: batchId, RK: itemId), and file (PK: batchId, RK: `{itemId}_{fileType}`). Item status is derived from its file statuses via `UpdateItemFromFilesAsync`. Batch completion is based on file count.
 
 **Storage**: All services (Table Storage, Queue, Durable Functions state) use the single `AzureWebJobsStorage` connection string. Locally → Azurite. In production → dedicated storage account separate from the function app's built-in storage.
 

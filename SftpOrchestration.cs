@@ -9,7 +9,8 @@ namespace AzFunctions;
 
 /// <summary>
 /// SFTP Processor (App 2) orchestration and activities. Creates person/address files,
-/// uploads them to the SFTP server with retry, and sends a completion callback to the Coordinator.
+/// uploads each independently to the SFTP server with retry (per-file error isolation),
+/// and sends a completion callback with per-file results to the Coordinator.
 /// </summary>
 public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory)
 {
@@ -28,7 +29,8 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
     /// <summary>
     /// Durable Functions orchestrator. Creates person and address files in parallel,
-    /// uploads both to SFTP with retry, then sends a callback to the Coordinator with the result.
+    /// then uploads each independently to SFTP with retry. Each file has its own try/catch
+    /// so a failure in one doesn't prevent the other. Sends a callback with per-file results.
     /// </summary>
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
@@ -53,38 +55,46 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
         string personFilePath = personFileTask.Result;
         string addressFilePath = addressFileTask.Result;
-        string[] filePaths = [personFilePath, addressFilePath];
 
-        // Upload each file with retry — parallel fan-out
-        bool succeeded = true;
-        string? errorMessage = null;
+        // Upload each file independently — a failure in one doesn't prevent the other
+        var fileResults = new List<FileResult>();
 
-        logger.LogInformation("[SFTP] Orchestration {id} — uploading 2 files to SFTP server...", id);
+        logger.LogInformation("[SFTP] Orchestration {id} — uploading person file to SFTP server...", id);
         try
         {
-            var uploadPersonTask = context.CallActivityAsync<string>(
-                nameof(UploadFile), personFilePath, UploadRetryOptions);
-            var uploadAddressTask = context.CallActivityAsync<string>(
-                nameof(UploadFile), addressFilePath, UploadRetryOptions);
-            await Task.WhenAll(uploadPersonTask, uploadAddressTask);
+            await context.CallActivityAsync<string>(nameof(UploadFile), personFilePath, UploadRetryOptions);
+            fileResults.Add(new FileResult(FileType.Person, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
-            logger.LogError(ex, "[SFTP] Orchestration {id} — upload failed after retries.", id);
-            succeeded = false;
-            errorMessage = ex.Message;
-            await context.CallActivityAsync(nameof(CleanupTempFiles), filePaths);
+            logger.LogError(ex, "[SFTP] Orchestration {id} — person file upload failed after retries.", id);
+            fileResults.Add(new FileResult(FileType.Person, Succeeded: false, ErrorMessage: ex.Message));
+            await context.CallActivityAsync(nameof(CleanupTempFiles), new[] { personFilePath });
         }
 
-        // Send callback to coordinator
-        var result = new SftpProcessResult(request.BatchId, request.ItemId, succeeded, errorMessage);
+        logger.LogInformation("[SFTP] Orchestration {id} — uploading address file to SFTP server...", id);
+        try
+        {
+            await context.CallActivityAsync<string>(nameof(UploadFile), addressFilePath, UploadRetryOptions);
+            fileResults.Add(new FileResult(FileType.Address, Succeeded: true, ErrorMessage: null));
+        }
+        catch (TaskFailedException ex)
+        {
+            logger.LogError(ex, "[SFTP] Orchestration {id} — address file upload failed after retries.", id);
+            fileResults.Add(new FileResult(FileType.Address, Succeeded: false, ErrorMessage: ex.Message));
+            await context.CallActivityAsync(nameof(CleanupTempFiles), new[] { addressFilePath });
+        }
+
+        // Send callback to coordinator with per-file results
+        var result = new SftpProcessResult(request.BatchId, request.ItemId, fileResults);
         await context.CallActivityAsync(nameof(SendCallback),
             new SendCallbackInput(request.CallbackUrl, result), CallbackRetryOptions);
 
-        logger.LogInformation("[SFTP] Orchestration {id} — complete (succeeded={succeeded}).", id, succeeded);
-        return succeeded
+        bool allSucceeded = fileResults.All(f => f.Succeeded);
+        logger.LogInformation("[SFTP] Orchestration {id} — complete (allSucceeded={allSucceeded}).", id, allSucceeded);
+        return allSucceeded
             ? $"Uploaded 2 files: {Path.GetFileName(personFilePath)}, {Path.GetFileName(addressFilePath)}."
-            : $"Failed: {errorMessage}";
+            : $"Partial failure: {string.Join(", ", fileResults.Where(f => !f.Succeeded).Select(f => f.FileType))}";
     }
 
     // --- Activity inputs ---
@@ -174,8 +184,9 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Result, JsonOptions);
         response.EnsureSuccessStatusCode();
 
-        logger.LogInformation("[SFTP] Callback sent for batch {batchId}, item {itemId} (succeeded={succeeded}).",
-            input.Result.BatchId, input.Result.ItemId, input.Result.Succeeded);
+        int successCount = input.Result.Files.Count(f => f.Succeeded);
+        logger.LogInformation("[SFTP] Callback sent for batch {batchId}, item {itemId} ({successCount}/{totalCount} files succeeded).",
+            input.Result.BatchId, input.Result.ItemId, successCount, input.Result.Files.Count);
     }
 
     // --- SFTP Server Inspection Endpoints ---
