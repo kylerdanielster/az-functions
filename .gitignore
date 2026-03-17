@@ -264,4 +264,4 @@ __pycache__/
 *.pyc
 
 # SFTP test data
-sftp-data/
+sftp-data/.azurite/

@@ -14,6 +14,11 @@
       "storageProvider": {
         "type": "AzureStorage"
       }
+    },
+    "queues": {
+      "maxPollingInterval": "00:00:05",
+      "visibilityTimeout": "00:05:00",
+      "maxDequeueCount": 5
     }
   }
 }

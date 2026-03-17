@@ -1,6 +1,6 @@
 # az-functions
 
-Azure Functions v4 project (.NET 10, isolated worker model) with a Durable Functions orchestration that collects person and address data via HTTP, creates files, and uploads them to an SFTP server.
+Azure Functions v4 project (.NET 10, isolated worker model) demonstrating a two-app batch processing architecture with Durable Functions, Storage Queues, and SFTP upload.
 
 ## Prerequisites
 
@@ -33,7 +33,8 @@ This file is gitignored. Create it in the project root:
     "SFTP_USERNAME": "testuser",
     "SFTP_PASSWORD": "testpass",
     "SFTP_REMOTE_PATH": "/config/upload",
-    "ORCHESTRATION_BASE_URL": "http://localhost:7071/api"
+    "PROCESSOR_BASE_URL": "http://localhost:7071",
+    "COORDINATOR_BASE_URL": "http://localhost:7071"
   }
 }
 ```
@@ -42,7 +43,7 @@ This file is gitignored. Create it in the project root:
 
 The project uses Docker Compose for local dependencies:
 
-- **Azurite** — Azure Storage emulator (required for durable functions)
+- **Azurite** — Azure Storage emulator (required for durable functions, table storage, and queues)
 - **OpenSSH Server** — local SFTP server for testing file uploads
 
 ```bash
@@ -57,139 +58,194 @@ func start
 
 The app runs on port 7071.
 
+## Storage
+
+All Azure Storage services use the single `AzureWebJobsStorage` connection string:
+
+| Service | Purpose |
+|---|---|
+| **Table Storage** (`BatchTracking`) | Batch metadata and item status tracking |
+| **Queue Storage** (`sftp-processing-queue`) | Decouples HTTP acceptance from orchestration processing |
+| **Blob/Table** (Durable Functions) | Orchestration state, history, and checkpoints |
+
+Locally, this points to **Azurite** (`UseDevelopmentStorage=true`) on ports 10000 (blob), 10001 (queue), 10002 (table).
+
+In production, this should be a **dedicated storage account** separate from the function app's built-in storage, to isolate application data from infrastructure state.
+
+## Architecture
+
+Two logical apps (Coordinator + SFTP Processor) running in a single function app for the POC. Communication uses HTTP + Storage Queue + callback.
+
+```
+App 1: Coordinator                          App 2: SFTP Processor
+─────────────────────                       ─────────────────────
+Function 1A: DataFeed (Timer)               Function 2A: ReceiveSftpRequest (HTTP)
+  1. Generate 10 fake payments (Bogus)        1. Accept POST with payments + callbackUrl
+  2. Create batch in Table Storage            2. Drop message onto Storage Queue
+  3. POST each item to App 2                  3. Return 202 Accepted immediately
+  4. Get 202 back, function exits
+                                            Function 2B: ProcessSftpQueue (Queue Trigger)
+Function 1B: BatchItemCompleted (HTTP)        1. Start Durable Functions orchestration
+  1. Receive callback { batchId, itemId }        (deterministic ID: sftp-{batchId}-{itemId})
+  2. Update item status in Table Storage
+  3. Query all items — all done?            SftpOrchestration (Orchestrator)
+  4. If yes → log "would notify 3rd party"    1. Parallel: CreatePersonFile + CreateAddressFile
+     + mark batch complete                    2. Parallel: UploadFile × 2 (with retry)
+  5. Return 200 OK                            3. SendCallback → POST to App 1's webhook
+```
+
+### Key design decisions
+
+- **Single-request flow**: No external events. Each item is a self-contained `SftpProcessRequest` with person data, address data, and callback URL.
+- **Deterministic instance IDs**: `sftp-{batchId}-{itemId}` prevents duplicate orchestrations from at-least-once queue delivery.
+- **No counters on batch entity**: Callback handler queries all items by batchId to check completion, avoiding race conditions from concurrent counter updates.
+- **Storage Queue**: Decouples HTTP acceptance from orchestration processing. Provides built-in retry with poison queue support.
+
+### Data model (Table Storage)
+
+**Table: BatchTracking**
+
+Batch entity (`PartitionKey: "batch"`, `RowKey: "{batchId}"`):
+- Status: `Processing` | `Completed` | `PartialFailure`
+- ItemCount, CreatedAt, CompletedAt
+
+Item entity (`PartitionKey: "{batchId}"`, `RowKey: "{itemId}"`):
+- Status: `Queued` | `Completed` | `Failed`
+- CreatedAt, CompletedAt, ErrorMessage
+
 ## Functions
 
 | Function | Trigger | Description |
 |---|---|---|
-| `SftpOrchestration_Start` | HTTP POST `/api/sftp/start` | Starts the SFTP orchestration, returns instance ID |
-| `SftpOrchestration_Person` | HTTP POST `/api/sftp/person/{instanceId}` | Sends person data to a running orchestration |
-| `SftpOrchestration_Address` | HTTP POST `/api/sftp/address/{instanceId}` | Sends address data to a running orchestration |
+| `RunDataFeed` | Timer (daily) | Generates batch of 10 fake payments, creates batch in Table Storage, POSTs each to processor |
+| `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as RunDataFeed but returns `{ batchId }` — for testing and manual use |
+| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + all item statuses from Table Storage |
+| `BatchItemCompleted` | HTTP POST `/api/batch/callback` | Receives completion callbacks, updates Table Storage, detects batch completion |
+| `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in BatchTracking table (test cleanup) |
+| `ReceiveSftpRequest` | HTTP POST `/api/sftp/process` | Accepts processing request, drops onto Storage Queue, returns 202 |
+| `ProcessSftpQueue` | Queue `sftp-processing-queue` | Starts Durable Functions orchestration with deterministic instance ID |
+| `SftpOrchestration` | Orchestration | Creates files in parallel, uploads to SFTP with retry, sends callback |
 | `SftpOrchestration_ListFiles` | HTTP GET `/api/sftp/files` | Lists files on the SFTP server |
 | `SftpOrchestration_GetFile` | HTTP GET `/api/sftp/files/{fileName}` | Returns the contents of a file from the SFTP server |
-| `RunDataFeed` | Timer (runs on app startup) | Generates fake data and triggers the full orchestration pipeline |
+| `SftpOrchestration_DeleteAllFiles` | HTTP DELETE `/api/sftp/files` | Deletes all files on SFTP server (test cleanup) |
 
 ## Data Feed
 
-The `SftpDataFeed` function (`SftpDataFeed.cs`) is a timer trigger that fires on app startup (`RunOnStartup = true`). It drives the full orchestration pipeline by generating fake data and sending it via HTTP to the orchestration endpoints.
-
-In production, this function will live in a separate function app and pull data from an external service. For now, it uses [Bogus](https://github.com/bchavez/Bogus) to generate random person and address data as a placeholder. It communicates with the orchestration exclusively over HTTP, so it's already decoupled and ready for separate deployment.
+The `SftpDataFeed` class (`SftpDataFeed.cs`) acts as the coordinator. It generates fake payment data using [Bogus](https://github.com/bchavez/Bogus) and submits batches for SFTP processing.
 
 ### What it does
 
-1. Generates a random `PersonData` and `AddressData` using Bogus
-2. `POST /api/sftp/start` — starts a new orchestration, extracts the instance ID
-3. `POST /api/sftp/person/{instanceId}` — sends person data
-4. `POST /api/sftp/address/{instanceId}` — sends address data
-5. The orchestration completes asynchronously (file creation, SFTP upload)
+1. Generates 10 random person + address pairs using Bogus
+2. Creates a batch entity and 10 item entities in Table Storage
+3. POSTs each `SftpProcessRequest` to `POST /api/sftp/process`
+4. Each request includes a `callbackUrl` pointing to `/api/batch/callback`
+5. As callbacks arrive, updates item status and checks batch completion
+6. When all items complete, logs "would notify third party"
+
+### Triggering manually
+
+```bash
+curl -X POST http://localhost:7071/admin/functions/RunDataFeed \
+  -H "Content-Type: application/json" -d '{}'
+```
 
 ### Configuration
 
 | Variable | Required | Description |
 |---|---|---|
-| `ORCHESTRATION_BASE_URL` | Yes | Base URL of the orchestration function app (e.g., `http://localhost:7071/api`) |
+| `PROCESSOR_BASE_URL` | Yes | Base URL of the SFTP processor (e.g., `http://localhost:7071`) |
+| `COORDINATOR_BASE_URL` | Yes | Base URL of the coordinator, used to build callback URLs |
 
-### Expected log output on startup
+### Expected log output
 
 ```
-[SFTP] Data feed starting — person: <first> <last>, address: <street>, <city>.
-[SFTP] Data feed orchestration <id> created.
-[SFTP] Data feed orchestration <id> — person data sent.
-[SFTP] Data feed orchestration <id> — address data sent, orchestration will complete asynchronously.
+[SFTP] Data feed starting — batch <batchId> with 10 items.
+[SFTP] Batch <batchId> — item item-000 queued (John Doe).
+...
+[SFTP] Batch <batchId> — item item-009 queued (Jane Smith).
+[SFTP] Data feed batch <batchId> — all 10 items submitted.
+[SFTP] Callback received — batch <batchId>, item item-000, status=Completed.
+...
+[SFTP] Batch <batchId> complete — would notify third party.
 ```
 
 ## SFTP Orchestration
 
-### What is a Durable Function?
+### How it works
 
-Azure Durable Functions extend Azure Functions with stateful workflows. The runtime automatically manages state, checkpoints, and restarts. Unlike regular (stateless) functions that process a single request and terminate, durable functions can pause, wait for external input, and resume — even across process restarts or infrastructure failures.
+The orchestration receives an `SftpProcessRequest` containing person data, address data, batch/item IDs, and a callback URL. It:
 
-### Why Durable Functions for this use case?
+1. Creates person and address files in parallel
+2. Uploads both files to SFTP in parallel (with retry policy: 3 attempts, 5s backoff)
+3. Sends a callback to the coordinator with the result
 
-This project needs to:
-
-- Accept two separate HTTP requests (person data and address data) that arrive independently and in any order
-- Guarantee the two pieces of data are paired correctly so concurrent sessions don't mix up person/address records
-- Wait until both pieces of data arrive before proceeding
-- Only trigger the SFTP upload after both files are created
-
-A stateless function can't do this — it processes a single request and has no way to wait for a second one. Durable Functions solve this with the **external events** pattern, where an orchestration can pause and wait for named events raised by other functions.
-
-### Key patterns used
-
-**External Events** — The orchestration uses `WaitForExternalEvent<T>()` to pause and wait for data from separate HTTP calls. This is how we decouple the two requests while keeping them correlated to the same orchestration instance.
-
-**Fan-out/Fan-in (parallel activities)** — Once both events arrive, person and address file creation runs in parallel via `Task.WhenAll`. The SFTP upload only starts after both activities complete.
-
-**Instance ID as correlation key** — The caller gets a unique instance ID from `POST /api/sftp/start` and includes it in subsequent requests (`/api/sftp/person/{instanceId}` and `/api/sftp/address/{instanceId}`). This ensures person and address data are always paired correctly, even when multiple sessions are running concurrently.
-
-### Architecture decisions
-
-- **Two separate endpoints** (person + address) rather than one combined payload — keeps request contracts explicit and strongly typed. Each endpoint knows exactly what data it expects.
-- **Explicit `/start` endpoint** rather than auto-starting on the first data request — provides a clearer orchestration lifecycle with no race conditions between the two data submissions.
-- **External events** rather than queue-based fan-in — simpler architecture with no extra infrastructure needed beyond what Durable Functions provides.
-- **Parallel file creation** rather than sequential — person and address files have no dependency on each other. Only the SFTP upload depends on both being complete.
+If upload fails after retries, the orchestration cleans up temp files and sends a failure callback.
 
 ### Request flow
 
 ```
-POST /api/sftp/start
-  └─► Creates orchestration, returns instanceId
+POST /api/sftp/process (SftpProcessRequest)
+  └─► 202 Accepted + message on sftp-processing-queue
         │
-        ├── POST /api/sftp/person/{instanceId}    (any order)
-        │     └─► Raises "PersonReceived" event
+        ▼
+  ProcessSftpQueue (queue trigger)
         │
-        └── POST /api/sftp/address/{instanceId}   (any order)
-              └─► Raises "AddressReceived" event
-                    │
-                    ▼
-              Orchestrator resumes (both events received)
-                    │
-              ┌─────┴─────┐
-              ▼           ▼
-        CreatePersonFile  CreateAddressFile   (parallel)
-              └─────┬─────┘
-                    ▼
-              UploadFile (per file, with retry)
+        ▼
+  SftpOrchestration (deterministic ID: sftp-{batchId}-{itemId})
+        │
+  ┌─────┴─────┐
+  ▼           ▼
+CreatePersonFile  CreateAddressFile   (parallel)
+  └─────┬─────┘
+        ▼
+  ┌─────┴─────┐
+  ▼           ▼
+UploadFile    UploadFile              (parallel, with retry)
+  └─────┬─────┘
+        ▼
+  SendCallback → POST /api/batch/callback
 ```
 
-### Example usage
+### Request schema
 
-```bash
-# 1. Start the orchestration
-curl -X POST http://localhost:7071/api/sftp/start
-# Returns 202 with instanceId in the response body
-
-# 2. Send person data (use the instanceId from step 1)
-curl -X POST http://localhost:7071/api/sftp/person/{instanceId} \
-  -H "Content-Type: application/json" \
-  -d '{"firstName":"John","lastName":"Doe","dateOfBirth":"1990-01-15"}'
-
-# 3. Send address data (can be sent before or after person data)
-curl -X POST http://localhost:7071/api/sftp/address/{instanceId} \
-  -H "Content-Type: application/json" \
-  -d '{"street":"123 Main St","city":"Springfield","state":"IL","zipCode":"62701"}'
-```
-
-### Request schemas
-
-**Person** (`POST /api/sftp/person/{instanceId}`):
+**POST /api/sftp/process**:
 ```json
 {
-  "firstName": "string",
-  "lastName": "string",
-  "dateOfBirth": "string"
+  "batchId": "string",
+  "itemId": "string",
+  "person": {
+    "firstName": "string",
+    "lastName": "string",
+    "dateOfBirth": "string"
+  },
+  "address": {
+    "street": "string",
+    "city": "string",
+    "state": "string",
+    "zipCode": "string"
+  },
+  "callbackUrl": "string"
 }
 ```
 
-**Address** (`POST /api/sftp/address/{instanceId}`):
+**Callback payload (POST to callbackUrl)**:
 ```json
 {
-  "street": "string",
-  "city": "string",
-  "state": "string",
-  "zipCode": "string"
+  "batchId": "string",
+  "itemId": "string",
+  "succeeded": true,
+  "errorMessage": null
 }
 ```
+
+### Error handling
+
+- **SFTP upload failure**: Activity retry policy (3 attempts, 5s backoff). If all fail, orchestration sends callback with `succeeded: false`.
+- **Queue delivery failure**: Azure retries up to 5x, then moves to `sftp-processing-queue-poison`.
+- **Callback failure**: `SendCallback` activity has its own retry policy (3 attempts, 5s backoff).
+- **Partial batch**: Each item is independent. Batch marked `PartialFailure` if any items failed.
+- **Idempotent callback**: Updating an already-completed item returns 200 without modification.
+- **Duplicate orchestration**: Deterministic instance ID (`sftp-{batchId}-{itemId}`) makes duplicate starts a no-op.
 
 ### Viewing files on the SFTP server
 
@@ -209,7 +265,7 @@ curl http://localhost:7071/api/sftp/files/{fileName}
 
 ```bash
 ls ./sftp-data/
-cat ./sftp-data/person_abc123.txt
+cat ./sftp-data/person_sftp-abc12345-item-000.txt
 ```
 
 **Via SSH into the container:**
@@ -220,9 +276,49 @@ ssh -p 2222 testuser@localhost
 ls /config/upload/
 ```
 
-### Testing end-to-end
+## Testing
 
-There's a test script that runs the full flow automatically:
+### Manual testing
+
+**Option A: Trigger a batch and check status**
+
+```bash
+# 1. Trigger the data feed — returns the batchId
+curl -s -X POST http://localhost:7071/api/datafeed/trigger | python3 -m json.tool
+
+# 2. Check batch status (replace BATCH_ID)
+curl -s http://localhost:7071/api/batch/BATCH_ID | python3 -m json.tool
+
+# 3. Check uploaded files
+curl -s http://localhost:7071/api/sftp/files | python3 -m json.tool
+
+# 4. Read a specific file
+curl -s http://localhost:7071/api/sftp/files/person_sftp-BATCH_ID-item-000.txt
+```
+
+**Option B: Submit a single item directly**
+
+```bash
+# POST a single processing request (bypasses the data feed)
+curl -s -X POST http://localhost:7071/api/sftp/process \
+  -H "Content-Type: application/json" \
+  -d '{
+    "batchId": "test01",
+    "itemId": "item-000",
+    "person": {"firstName":"John","lastName":"Doe","dateOfBirth":"1990-01-15"},
+    "address": {"street":"123 Main St","city":"Springfield","state":"IL","zipCode":"62701"},
+    "callbackUrl": "http://localhost:7071/api/batch/callback"
+  }' | python3 -m json.tool
+```
+
+**Cleanup endpoints** (useful between manual test runs):
+
+```bash
+curl -s -X DELETE http://localhost:7071/api/batch       # clear batch tracking data
+curl -s -X DELETE http://localhost:7071/api/sftp/files   # clear SFTP files
+```
+
+### End-to-end test
 
 ```bash
 # Make sure Docker services and func are running first
@@ -234,111 +330,46 @@ func start  # in another terminal
 ```
 
 The script will:
-1. Start an orchestration and display the instance ID
-2. Send randomly generated person data (via Bogus)
-3. Send randomly generated address data (via Bogus)
-4. Poll until the orchestration completes
-5. Show the total file count on the SFTP server
-6. Print the contents of the two files uploaded by this run (matched by instance ID)
+1. Clean up previous test data (batch tracking entities + SFTP files)
+2. Trigger a batch of 10 items and capture the batchId
+3. Poll batch status from Table Storage until all items complete
+4. Display item-by-item status table (ItemId, Status, CompletedAt)
+5. Verify 20 SFTP files uploaded and read a sample
+6. Print pass/fail summary
 
-**Expected console output from `func start`:**
+### Expected test output
 
 ```
-[SFTP] Orchestration <id> created.
-[SFTP] Orchestration <id> started — waiting for person and address data.
-[SFTP] Orchestration <id> — person data received (<first> <last>).
-[SFTP] Orchestration <id> — address data received (<street>, <city>).
-[SFTP] Orchestration <id> — creating files...
-[SFTP] Created person file at /tmp/person_<id>.txt.
-[SFTP] Created address file at /tmp/address_<id>.txt.
-[SFTP] Orchestration <id> — uploading 2 files to SFTP server...
-[SFTP] Connected to SFTP server localhost:2222.
-[SFTP] Uploaded person_<id>.txt to /config/upload/person_<id>.txt.
-[SFTP] Uploaded address_<id>.txt to /config/upload/address_<id>.txt.
-[SFTP] Orchestration <id> — complete!
-```
+Step 1: Cleaning up previous test data...
+  Batch tracking: cleared 11 entities
+  SFTP files: cleared 20 files
 
-**Expected uploaded file contents:**
+Step 2: Triggering data feed...
+  Started batch abc12345 with 10 items
 
-`person_<id>.txt`:
-```
-First Name: <randomly generated>
-Last Name: <randomly generated>
-Date of Birth: <randomly generated>
-```
+Step 3: Waiting for batch to complete...
+  Poll 1: 10/10 items done (batch: Completed)
+  Item Status:
+  item-000     Completed    2026-03-16T19:44:40
+  item-001     Completed    2026-03-16T19:44:40
+  ...
 
-`address_<id>.txt`:
-```
-Street: <randomly generated>
-City: <randomly generated>
-State: <randomly generated>
-Zip Code: <randomly generated>
-```
+Step 4: Verifying SFTP files...
+  Total files: 20 (person: 10, address: 10)
 
-### Testing upload retry
-
-There's a separate script that verifies the retry policy works by stopping the SFTP container, triggering the orchestration, then restarting SFTP within the retry window:
-
-```bash
-./test-sftp-retry.sh
-```
-
-The script will stop the SFTP container, start an orchestration, wait for the first upload attempt to fail, restart SFTP, and verify the orchestration completes via retry.
-
-### Manual step-by-step testing
-
-If you prefer to test manually, run each curl command one at a time:
-
-```bash
-# 1. Start the orchestration
-curl -s -X POST http://localhost:7071/api/sftp/start | python3 -m json.tool
-# Copy the "id" value from the response
-
-# 2. Send person data (replace INSTANCE_ID)
-curl -s -X POST http://localhost:7071/api/sftp/person/INSTANCE_ID \
-  -H "Content-Type: application/json" \
-  -d '{"firstName":"John","lastName":"Doe","dateOfBirth":"1990-01-15"}' | python3 -m json.tool
-
-# 3. Send address data (replace INSTANCE_ID)
-curl -s -X POST http://localhost:7071/api/sftp/address/INSTANCE_ID \
-  -H "Content-Type: application/json" \
-  -d '{"street":"123 Main St","city":"Springfield","state":"IL","zipCode":"62701"}' | python3 -m json.tool
-
-# 4. Check orchestration status (use statusQueryGetUri from step 1 response)
-curl -s "STATUS_QUERY_URL" | python3 -m json.tool
-
-# 5. List files on the SFTP server
-curl -s http://localhost:7071/api/sftp/files | python3 -m json.tool
-
-# 6. Read a specific file
-curl -s http://localhost:7071/api/sftp/files/person_xxx.txt
+Summary:
+  Batch: Completed | Items: 10 completed, 0 failed | Files: 20 | PASS
 ```
 
 ## SFTP via SSH.NET
 
-SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`), a .NET library for SSH and SFTP operations. The project uses its `SftpClient` class to connect, upload, list, and read files on a remote SFTP server.
+SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`). The `SftpClient` is used in three places within `SftpOrchestration.cs`:
 
-### How it's used
-
-The `SftpClient` is created in three places, all within `SftpOrchestration.cs`:
-
-- **`UploadFile` activity** — connects to the SFTP server, uploads a single file to the configured remote path, then deletes the local temp file. Called once per file with a retry policy (3 attempts, 5s backoff).
-- **`ListFiles` HTTP trigger** — connects and lists all files in the remote upload directory.
-- **`GetFile` HTTP trigger** — connects and reads the contents of a specific file by name.
-
-Each usage follows the same pattern:
-
-```csharp
-using var client = new SftpClient(host, port, username, password);
-client.OperationTimeout = TimeSpan.FromSeconds(30);
-client.Connect();
-// ... upload, list, or read files
-// client is disposed (and disconnected) by the using statement
-```
+- **`UploadFile` activity** — uploads a single file with retry policy
+- **`ListFiles` HTTP trigger** — lists all files in the remote upload directory
+- **`GetFile` HTTP trigger** — reads a specific file by name
 
 ### Configuration
-
-Connection details are read from environment variables (set in `local.settings.json` for local dev):
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -348,15 +379,11 @@ Connection details are read from environment variables (set in `local.settings.j
 | `SFTP_PASSWORD` | Yes | — | Login password |
 | `SFTP_REMOTE_PATH` | No | `/upload` | Remote directory for uploads |
 
-### Local development
-
-For local testing, the Docker Compose setup includes an OpenSSH server container that acts as the SFTP server (see Docker Services below). The `local.settings.json` values point to this container (`localhost:2222`, user `testuser`, password `testpass`).
-
 ## Docker Services
 
 | Service | Image | Ports | Purpose |
 |---|---|---|---|
-| azurite | `mcr.microsoft.com/azure-storage/azurite` | 10000, 10001, 10002 | Azure Storage emulator (durable functions state) |
+| azurite | `mcr.microsoft.com/azure-storage/azurite` | 10000, 10001, 10002 | Azure Storage emulator (durable functions state, table storage, queues) |
 | sftp | `lscr.io/linuxserver/openssh-server` | 2222 | SFTP server for testing |
 
 ### SFTP server credentials

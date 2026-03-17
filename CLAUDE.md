@@ -8,26 +8,35 @@ C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP.
 
 ## Architecture
 
-Single Durable Functions orchestration (`SftpOrchestration`) using the **external events** pattern:
+Two-app architecture for batch payment processing using HTTP + Storage Queue + callback:
 
-1. `POST /api/sftp/start` — creates orchestration, returns instance ID
-2. Orchestrator waits on two `WaitForExternalEvent` calls (person + address)
-3. `Task.WhenAll` fan-in — both events must arrive before proceeding
-4. Person and address files created as parallel activities
-5. Both files uploaded to SFTP after creation completes
+**App 1: Coordinator** (`SftpDataFeed.cs`)
+1. `RunDataFeed` (Timer) / `TriggerDataFeed` (HTTP) — generates 10 fake payments via Bogus, creates batch in Table Storage, POSTs each item to App 2
+2. `BatchItemCompleted` (HTTP callback) — receives completion callbacks, updates Table Storage, detects batch completion
+3. `GetBatchStatus` (HTTP GET) — returns batch + item statuses from Table Storage
+4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)
 
-**State storage**: Azure Storage (Azurite locally) via `AzureWebJobsStorage` + `host.json` durable task config.
+**App 2: SFTP Processor** (`SftpProcessor.cs` + `SftpOrchestration.cs`)
+1. `ReceiveSftpRequest` (HTTP) — accepts POST with payments + callbackUrl, drops onto Storage Queue, returns 202
+2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}-{itemId}`)
+3. `SftpOrchestration` (Orchestrator) — creates person + address files in parallel, uploads to SFTP with retry, sends callback
+
+**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Batch entity + item entities per batch.
+
+**Storage**: All services (Table Storage, Queue, Durable Functions state) use the single `AzureWebJobsStorage` connection string. Locally → Azurite. In production → dedicated storage account separate from the function app's built-in storage.
 
 **SFTP**: SSH.NET (`Renci.SshNet`). Local server via OpenSSH Docker container (port 2222).
 
 **File layout**:
 ```
 Program.cs                    Entry point and DI configuration
-SftpOrchestration.cs          Orchestrator, activities, HTTP triggers
-SftpDataFeed.cs               Timer trigger — generates data and starts orchestration on app startup
-host.json                     Azure Functions and durable task config
+Models.cs                     Shared records (data, request/response, batch status)
+BatchTracking.cs              IBatchTracker interface + TableBatchTracker implementation
+SftpProcessor.cs              HTTP receiver + queue trigger (App 2 entry points)
+SftpOrchestration.cs          Orchestrator, file creation/upload activities, callback, SFTP endpoints
+SftpDataFeed.cs               Timer/HTTP triggers, batch status, callback webhook (App 1)
+host.json                     Azure Functions, durable task, and queue config
 docker-compose.yml            Azurite + SFTP containers for local dev
-tools/generate-test-data/     Bogus-based fake data generator
 test-sftp-orchestration.sh    E2E test script
 ```
 

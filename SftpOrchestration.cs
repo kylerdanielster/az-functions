@@ -1,26 +1,29 @@
+using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
-using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
 using Renci.SshNet;
 
 namespace Company.Function;
 
-public record PersonData(string FirstName, string LastName, string DateOfBirth);
-public record AddressData(string Street, string City, string State, string ZipCode);
-public record CreateFileInput<T>(string InstanceId, T Data);
-
 public static class SftpOrchestration
 {
-    private const string PersonReceivedEvent = "PersonReceived";
-    private const string AddressReceivedEvent = "AddressReceived";
     private static readonly TimeSpan SftpTimeout = TimeSpan.FromSeconds(30);
 
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
         maxNumberOfAttempts: 3,
         firstRetryInterval: TimeSpan.FromSeconds(5)));
+
+    private static readonly TaskOptions CallbackRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
+        maxNumberOfAttempts: 3,
+        firstRetryInterval: TimeSpan.FromSeconds(5)));
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
 
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
@@ -29,28 +32,29 @@ public static class SftpOrchestration
         ILogger logger = context.CreateReplaySafeLogger(nameof(SftpOrchestration));
         string id = context.InstanceId;
 
-        logger.LogInformation("[SFTP] Orchestration {id} started — waiting for person and address data.", id);
-        var personTask = context.WaitForExternalEvent<PersonData>(PersonReceivedEvent);
-        var addressTask = context.WaitForExternalEvent<AddressData>(AddressReceivedEvent);
-        await Task.WhenAll(personTask, addressTask);
+        var request = context.GetInput<SftpProcessRequest>()
+            ?? throw new InvalidOperationException("Orchestration input is missing.");
 
-        PersonData person = personTask.Result;
-        AddressData address = addressTask.Result;
-        logger.LogInformation("[SFTP] Orchestration {id} — received both person ({first} {last}) and address ({street}, {city}).",
-            id, person.FirstName, person.LastName, address.Street, address.City);
+        logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, item {itemId}.",
+            id, request.BatchId, request.ItemId);
 
         // Create both files in parallel
         logger.LogInformation("[SFTP] Orchestration {id} — creating files...", id);
-        var personFileTask = context.CallActivityAsync<string>(nameof(CreatePersonFile), new CreateFileInput<PersonData>(id, person));
-        var addressFileTask = context.CallActivityAsync<string>(nameof(CreateAddressFile), new CreateFileInput<AddressData>(id, address));
+        var personFileTask = context.CallActivityAsync<string>(nameof(CreatePersonFile),
+            new CreatePersonFileInput(id, request.Person));
+        var addressFileTask = context.CallActivityAsync<string>(nameof(CreateAddressFile),
+            new CreateAddressFileInput(id, request.Address));
         await Task.WhenAll(personFileTask, addressFileTask);
 
         string personFilePath = personFileTask.Result;
         string addressFilePath = addressFileTask.Result;
-
-        // Upload each file independently with retry — parallel fan-out
-        logger.LogInformation("[SFTP] Orchestration {id} — uploading 2 files to SFTP server...", id);
         string[] filePaths = [personFilePath, addressFilePath];
+
+        // Upload each file with retry — parallel fan-out
+        bool succeeded = true;
+        string? errorMessage = null;
+
+        logger.LogInformation("[SFTP] Orchestration {id} — uploading 2 files to SFTP server...", id);
         try
         {
             var uploadPersonTask = context.CallActivityAsync<string>(
@@ -62,19 +66,36 @@ public static class SftpOrchestration
         catch (TaskFailedException ex)
         {
             logger.LogError(ex, "[SFTP] Orchestration {id} — upload failed after retries.", id);
+            succeeded = false;
+            errorMessage = ex.Message;
             await context.CallActivityAsync(nameof(CleanupTempFiles), filePaths);
-            throw;
         }
 
-        logger.LogInformation("[SFTP] Orchestration {id} — complete!", id);
-        return $"Uploaded 2 files: {Path.GetFileName(personFilePath)}, {Path.GetFileName(addressFilePath)}.";
+        // Send callback to coordinator
+        var result = new SftpProcessResult(request.BatchId, request.ItemId, succeeded, errorMessage);
+        await context.CallActivityAsync(nameof(SendCallback),
+            new SendCallbackInput(request.CallbackUrl, result), CallbackRetryOptions);
+
+        logger.LogInformation("[SFTP] Orchestration {id} — complete (succeeded={succeeded}).", id, succeeded);
+        return succeeded
+            ? $"Uploaded 2 files: {Path.GetFileName(personFilePath)}, {Path.GetFileName(addressFilePath)}."
+            : $"Failed: {errorMessage}";
     }
 
+    // --- Activity inputs ---
+
+    public record CreatePersonFileInput(string InstanceId, PersonData Person);
+    public record CreateAddressFileInput(string InstanceId, AddressData Address);
+    public record SendCallbackInput(string CallbackUrl, SftpProcessResult Result);
+
+    // --- Activities ---
+
     [Function(nameof(CreatePersonFile))]
-    public static string CreatePersonFile([ActivityTrigger] CreateFileInput<PersonData> input, FunctionContext executionContext)
+    public static string CreatePersonFile([ActivityTrigger] CreatePersonFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(CreatePersonFile));
-        var person = input.Data;
+        var person = input.Person;
+
         string path = Path.Combine(Path.GetTempPath(), $"person_{input.InstanceId}.txt");
         string content = $"First Name: {person.FirstName}\nLast Name: {person.LastName}\nDate of Birth: {person.DateOfBirth}";
         File.WriteAllText(path, content);
@@ -83,10 +104,11 @@ public static class SftpOrchestration
     }
 
     [Function(nameof(CreateAddressFile))]
-    public static string CreateAddressFile([ActivityTrigger] CreateFileInput<AddressData> input, FunctionContext executionContext)
+    public static string CreateAddressFile([ActivityTrigger] CreateAddressFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(CreateAddressFile));
-        var address = input.Data;
+        var address = input.Address;
+
         string path = Path.Combine(Path.GetTempPath(), $"address_{input.InstanceId}.txt");
         string content = $"Street: {address.Street}\nCity: {address.City}\nState: {address.State}\nZip Code: {address.ZipCode}";
         File.WriteAllText(path, content);
@@ -144,72 +166,57 @@ public static class SftpOrchestration
         }
     }
 
-    // --- HTTP Triggers ---
-
-    [Function("SftpOrchestration_Start")]
-    public static async Task<HttpResponseData> Start(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "sftp/start")] HttpRequestData req,
-        [DurableClient] DurableTaskClient client,
-        FunctionContext executionContext)
+    [Function(nameof(SendCallback))]
+    public static async Task SendCallback([ActivityTrigger] SendCallbackInput input, FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger("SftpOrchestration_Start");
-        string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
-            nameof(SftpOrchestration));
-        logger.LogInformation("[SFTP] Orchestration {id} created.", instanceId);
-        return await client.CreateCheckStatusResponseAsync(req, instanceId);
-    }
+        ILogger logger = executionContext.GetLogger(nameof(SendCallback));
 
-    [Function("SftpOrchestration_Person")]
-    public static async Task<HttpResponseData> SubmitPerson(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "sftp/person/{instanceId}")] HttpRequestData req,
-        string instanceId,
-        [DurableClient] DurableTaskClient client,
-        FunctionContext executionContext)
-    {
-        ILogger logger = executionContext.GetLogger("SftpOrchestration_Person");
-        var person = await req.ReadFromJsonAsync<PersonData>();
-        if (person is null)
-        {
-            var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            await badRequest.WriteStringAsync("Invalid or missing person data.");
-            return badRequest;
-        }
+        using var httpClient = new HttpClient();
+        var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Result, JsonOptions);
+        response.EnsureSuccessStatusCode();
 
-        await client.RaiseEventAsync(instanceId, PersonReceivedEvent, person);
-        logger.LogInformation("[SFTP] Orchestration {id} — person data received ({first} {last}).",
-            instanceId, person.FirstName, person.LastName);
-
-        var response = req.CreateResponse(System.Net.HttpStatusCode.Accepted);
-        await response.WriteAsJsonAsync(new { instanceId, @event = "PersonReceived" });
-        return response;
-    }
-
-    [Function("SftpOrchestration_Address")]
-    public static async Task<HttpResponseData> SubmitAddress(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "sftp/address/{instanceId}")] HttpRequestData req,
-        string instanceId,
-        [DurableClient] DurableTaskClient client,
-        FunctionContext executionContext)
-    {
-        ILogger logger = executionContext.GetLogger("SftpOrchestration_Address");
-        var address = await req.ReadFromJsonAsync<AddressData>();
-        if (address is null)
-        {
-            var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            await badRequest.WriteStringAsync("Invalid or missing address data.");
-            return badRequest;
-        }
-
-        await client.RaiseEventAsync(instanceId, AddressReceivedEvent, address);
-        logger.LogInformation("[SFTP] Orchestration {id} — address data received ({street}, {city}).",
-            instanceId, address.Street, address.City);
-
-        var response = req.CreateResponse(System.Net.HttpStatusCode.Accepted);
-        await response.WriteAsJsonAsync(new { instanceId, @event = "AddressReceived" });
-        return response;
+        logger.LogInformation("[SFTP] Callback sent for batch {batchId}, item {itemId} (succeeded={succeeded}).",
+            input.Result.BatchId, input.Result.ItemId, input.Result.Succeeded);
     }
 
     // --- SFTP Server Inspection Endpoints ---
+
+    // Testing: deletes all SFTP files (used by E2E test script)
+    [Function("SftpOrchestration_DeleteAllFiles")]
+    public static async Task<HttpResponseData> DeleteAllFiles(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "sftp/files")] HttpRequestData req,
+        FunctionContext executionContext)
+    {
+        ILogger logger = executionContext.GetLogger("SftpOrchestration_DeleteAllFiles");
+
+        string host = Environment.GetEnvironmentVariable("SFTP_HOST")
+            ?? throw new InvalidOperationException("SFTP_HOST not configured.");
+        int port = int.Parse(Environment.GetEnvironmentVariable("SFTP_PORT") ?? "22");
+        string username = Environment.GetEnvironmentVariable("SFTP_USERNAME")
+            ?? throw new InvalidOperationException("SFTP_USERNAME not configured.");
+        string password = Environment.GetEnvironmentVariable("SFTP_PASSWORD")
+            ?? throw new InvalidOperationException("SFTP_PASSWORD not configured.");
+        string remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
+
+        using var client = new SftpClient(host, port, username, password);
+        client.OperationTimeout = SftpTimeout;
+        client.Connect();
+
+        var files = client.ListDirectory(remotePath)
+            .Where(f => !f.IsDirectory)
+            .ToList();
+
+        foreach (var file in files)
+        {
+            client.DeleteFile($"{remotePath}/{file.Name}");
+        }
+
+        logger.LogInformation("[SFTP] Deleted {count} files from SFTP server.", files.Count);
+
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        await response.WriteAsJsonAsync(new { deleted = files.Count });
+        return response;
+    }
 
     [Function("SftpOrchestration_ListFiles")]
     public static async Task<HttpResponseData> ListFiles(
