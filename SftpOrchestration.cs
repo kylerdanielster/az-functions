@@ -180,7 +180,10 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
     // --- SFTP Server Inspection Endpoints ---
 
-    // Testing: deletes all SFTP files (used by E2E test script)
+    /// <summary>
+    /// Testing: Deletes all files from the SFTP server's remote upload directory.
+    /// Route: DELETE /api/sftp/files
+    /// </summary>
     [Function("SftpOrchestration_DeleteAllFiles")]
     public async Task<HttpResponseData> DeleteAllFiles(
         [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "sftp/files")] HttpRequestData req,
@@ -206,6 +209,10 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return response;
     }
 
+    /// <summary>
+    /// Testing: Lists all files on the SFTP server with name, size, and last modified time.
+    /// Route: GET /api/sftp/files
+    /// </summary>
     [Function("SftpOrchestration_ListFiles")]
     public async Task<HttpResponseData> ListFiles(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files")] HttpRequestData req,
@@ -227,6 +234,10 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return response;
     }
 
+    /// <summary>
+    /// Testing: Returns the contents of a specific file from the SFTP server.
+    /// Route: GET /api/sftp/files/{fileName}
+    /// </summary>
     [Function("SftpOrchestration_GetFile")]
     public async Task<HttpResponseData> GetFile(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files/{fileName}")] HttpRequestData req,

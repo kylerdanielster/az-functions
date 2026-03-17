@@ -95,6 +95,10 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         return response;
     }
 
+    /// <summary>
+    /// Creates a batch in Table Storage, generates fake person/address pairs,
+    /// and POSTs each item to the SFTP Processor. Returns the batch ID.
+    /// </summary>
     private async Task<string> GenerateBatchAsync(ILogger logger)
     {
         string processorBaseUrl = Environment.GetEnvironmentVariable("PROCESSOR_BASE_URL")
