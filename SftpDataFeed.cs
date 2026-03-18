@@ -9,25 +9,12 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// Coordinator (App 1). Generates fake payment batches, submits the entire batch to the SFTP Processor,
+/// Coordinator (App 1). Generates fake ACH payment batches, submits the entire batch to the SFTP Processor,
 /// and receives a single completion callback to track batch progress.
 /// </summary>
 public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker batchTracker)
 {
     private const int BatchSize = 10;
-
-    private static readonly Faker<PersonData> PersonFaker = new Faker<PersonData>()
-        .CustomInstantiator(f => new PersonData(
-            f.Name.FirstName(),
-            f.Name.LastName(),
-            f.Date.Past(50, DateTime.Now.AddYears(-18)).ToString("yyyy-MM-dd")));
-
-    private static readonly Faker<AddressData> AddressFaker = new Faker<AddressData>()
-        .CustomInstantiator(f => new AddressData(
-            f.Address.StreetAddress(),
-            f.Address.City(),
-            f.Address.StateAbbr(),
-            f.Address.ZipCode("#####")));
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -87,17 +74,32 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
 
         await batchTracker.CompleteBatchFromResultsAsync(result.BatchId, result.Files);
 
-        bool allSucceeded = result.Files.All(f => f.Succeeded);
-        string status = allSucceeded ? BatchStatus.Completed : BatchStatus.PartialFailure;
+        bool paymentOk = result.Files.Where(f => f.FileType == FileType.Payment).All(f => f.Succeeded);
+        bool glOk = result.Files.Where(f => f.FileType == FileType.GeneralLedger).All(f => f.Succeeded);
+
+        string status = (paymentOk, glOk) switch
+        {
+            (true, true) => BatchStatus.Processed,
+            (false, true) => BatchStatus.PaymentFileFailed,
+            (true, false) => BatchStatus.GLFileFailed,
+            (false, false) => BatchStatus.Failed
+        };
 
         logger.LogInformation("[SFTP] Batch {batchId} completed — status={status}, {successCount}/{totalCount} files succeeded.",
             result.BatchId, status, result.Files.Count(f => f.Succeeded), result.Files.Count);
 
-        if (allSucceeded)
+        if (status == BatchStatus.Processed)
         {
             // TODO: Notify third party that batch payment processing is complete.
             // This should call the third party's API to mark their payment records as completed.
-            logger.LogInformation("[SFTP] Batch {batchId} complete — would notify third party.", result.BatchId);
+            logger.LogInformation("[SFTP] Batch {batchId} processed — would notify third party.", result.BatchId);
+        }
+        else
+        {
+            // TODO: Send alert email to users notifying them that one or both files failed.
+            var failedFiles = result.Files.Where(f => !f.Succeeded).Select(f => f.FileType);
+            logger.LogWarning("[SFTP] Batch {batchId} had file failures ({status}): {failedFiles} — alert email not yet implemented.",
+                result.BatchId, status, string.Join(", ", failedFiles));
         }
 
         var response = req.CreateResponse(HttpStatusCode.OK);
@@ -106,7 +108,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
     }
 
     /// <summary>
-    /// Creates a batch with file entities in Table Storage, generates fake person/address pairs,
+    /// Creates a batch with file and payment entities in Table Storage, generates fake ACH payments,
     /// and POSTs the entire batch to the SFTP Processor. Returns the batch ID.
     /// On submission failure, both files are marked as Failed.
     /// </summary>
@@ -120,23 +122,30 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         string batchId = Guid.NewGuid().ToString("N")[..8];
         string callbackUrl = $"{coordinatorBaseUrl}/api/batch/callback";
 
-        logger.LogInformation("[SFTP] Data feed starting — batch {batchId} with {count} items.",
+        logger.LogInformation("[SFTP] Data feed starting — batch {batchId} with {count} payments.",
             batchId, BatchSize);
 
         await batchTracker.CreateBatchAsync(batchId, BatchSize);
-        await batchTracker.CreateFileAsync(batchId, FileType.Person);
-        await batchTracker.CreateFileAsync(batchId, FileType.Address);
+        await batchTracker.CreateFileAsync(batchId, FileType.Payment);
+        await batchTracker.CreateFileAsync(batchId, FileType.GeneralLedger);
 
-        var items = new List<BatchItem>();
+        var faker = new Faker();
+        var payments = new List<PaymentData>();
         for (int i = 0; i < BatchSize; i++)
         {
-            string itemId = $"item-{i:D3}";
-            var person = PersonFaker.Generate();
-            var address = AddressFaker.Generate();
-            items.Add(new BatchItem(itemId, person, address));
+            string paymentId = $"pmt-{i:D3}";
+            payments.Add(new PaymentData(
+                paymentId,
+                faker.Name.FullName(),
+                faker.Company.CompanyName(),
+                Math.Round(faker.Random.Decimal(100m, 50000m), 2),
+                faker.Finance.Account(10),
+                faker.Finance.RoutingNumber(),
+                faker.Date.Recent(30).ToString("yyyy-MM-dd")));
+            await batchTracker.CreatePaymentAsync(batchId, paymentId);
         }
 
-        var request = new SftpBatchRequest(batchId, items, callbackUrl);
+        var request = new SftpBatchRequest(batchId, payments, callbackUrl);
 
         using var httpClient = httpClientFactory.CreateClient();
         try
@@ -145,7 +154,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
                 $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
             response.EnsureSuccessStatusCode();
 
-            logger.LogInformation("[SFTP] Batch {batchId} submitted — {count} items.",
+            logger.LogInformation("[SFTP] Batch {batchId} submitted — {count} payments.",
                 batchId, BatchSize);
         }
         catch (Exception ex)
@@ -153,8 +162,8 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
             logger.LogError(ex, "[SFTP] Batch {batchId} — failed to submit.", batchId);
 
             await batchTracker.CompleteBatchFromResultsAsync(batchId, [
-                new FileResult(FileType.Person, Succeeded: false, ErrorMessage: "Submission failed"),
-                new FileResult(FileType.Address, Succeeded: false, ErrorMessage: "Submission failed")
+                new FileResult(FileType.Payment, Succeeded: false, ErrorMessage: "Submission failed"),
+                new FileResult(FileType.GeneralLedger, Succeeded: false, ErrorMessage: "Submission failed")
             ]);
         }
 
@@ -178,7 +187,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         return response;
     }
 
-    // Testing: returns batch + file statuses from Table Storage (used by E2E test script)
+    // Testing: returns batch + file + payment statuses from Table Storage (used by E2E test script)
     [Function(nameof(GetBatchStatus))]
     public async Task<HttpResponseData> GetBatchStatus(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "batch/{batchId}")] HttpRequestData req,
@@ -194,11 +203,12 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
 
         var files = await batchTracker.GetBatchFilesAsync(batchId);
+        var paymentEntities = await batchTracker.GetBatchPaymentsAsync(batchId);
 
         var result = new BatchStatusResponse(
             BatchId: batchId,
             Status: batch.GetString("Status") ?? "Unknown",
-            ItemCount: batch.GetInt32("ItemCount") ?? 0,
+            PaymentCount: batch.GetInt32("PaymentCount") ?? 0,
             CreatedAt: batch.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue,
             CompletedAt: batch.GetDateTimeOffset("CompletedAt"),
             Files: files
@@ -209,6 +219,13 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
                     CompletedAt: f.GetDateTimeOffset("CompletedAt"),
                     ErrorMessage: f.GetString("ErrorMessage")))
                 .OrderBy(f => f.FileType)
+                .ToList(),
+            Payments: paymentEntities
+                .Select(p => new PaymentStatus(
+                    PaymentId: p.RowKey,
+                    Status: p.GetString("Status") ?? "Unknown",
+                    CreatedAt: p.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue))
+                .OrderBy(p => p.PaymentId)
                 .ToList());
 
         var response = req.CreateResponse(HttpStatusCode.OK);

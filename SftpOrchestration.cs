@@ -9,8 +9,8 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// SFTP Processor (App 2) orchestration and activities. Generates combined person/address CSV
-/// files from all batch items and uploads each independently to the SFTP server with retry
+/// SFTP Processor (App 2) orchestration and activities. Generates payment and GL CSV
+/// files from all batch payments and uploads each independently to the SFTP server with retry
 /// (per-file error isolation). Sends a completion callback with per-file results to the Coordinator.
 /// Callback failure is isolated from file uploads — see <see cref="RunOrchestrator"/>.
 /// </summary>
@@ -30,8 +30,8 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     };
 
     /// <summary>
-    /// Durable Functions orchestrator. Generates combined person and address CSV files in parallel
-    /// from all batch items, then uploads each from memory to SFTP with retry. Each file has its
+    /// Durable Functions orchestrator. Generates payment and GL CSV files in parallel
+    /// from all batch payments, then uploads each from memory to SFTP with retry. Each file has its
     /// own try/catch so a failure in one doesn't prevent the other. Sends a callback with per-file results.
     /// Callback failure is isolated — if the callback fails after retries, the orchestration
     /// still completes (files are already uploaded).
@@ -46,50 +46,50 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         var request = context.GetInput<SftpBatchRequest>()
             ?? throw new InvalidOperationException("Orchestration input is missing.");
 
-        logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, {itemCount} items.",
-            id, request.BatchId, request.Items.Count);
+        logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, {paymentCount} payments.",
+            id, request.BatchId, request.Payments.Count);
 
         // Create file content in parallel
         logger.LogInformation("[SFTP] Orchestration {id} — creating CSV files...", id);
-        var personContentTask = context.CallActivityAsync<string>(nameof(CreatePersonFile),
-            new CreatePersonFileInput(request.BatchId, request.Items));
-        var addressContentTask = context.CallActivityAsync<string>(nameof(CreateAddressFile),
-            new CreateAddressFileInput(request.BatchId, request.Items));
-        await Task.WhenAll(personContentTask, addressContentTask);
+        var paymentContentTask = context.CallActivityAsync<string>(nameof(CreatePaymentFile),
+            new CreatePaymentFileInput(request.BatchId, request.Payments));
+        var glContentTask = context.CallActivityAsync<string>(nameof(CreateGLFile),
+            new CreateGLFileInput(request.BatchId, request.Payments));
+        await Task.WhenAll(paymentContentTask, glContentTask);
 
-        string personContent = personContentTask.Result;
-        string addressContent = addressContentTask.Result;
+        string paymentContent = paymentContentTask.Result;
+        string glContent = glContentTask.Result;
 
-        string personFileName = $"person_{request.BatchId}.csv";
-        string addressFileName = $"address_{request.BatchId}.csv";
+        string paymentFileName = $"payment_{request.BatchId}.csv";
+        string glFileName = $"gl_{request.BatchId}.csv";
 
         // Upload each file independently — a failure in one doesn't prevent the other
         var fileResults = new List<FileResult>();
 
-        logger.LogInformation("[SFTP] Orchestration {id} — uploading person file to SFTP server...", id);
+        logger.LogInformation("[SFTP] Orchestration {id} — uploading payment file to SFTP server...", id);
         try
         {
             await context.CallActivityAsync<string>(nameof(UploadFile),
-                new UploadFileInput(personFileName, personContent), UploadRetryOptions);
-            fileResults.Add(new FileResult(FileType.Person, Succeeded: true, ErrorMessage: null));
+                new UploadFileInput(paymentFileName, paymentContent), UploadRetryOptions);
+            fileResults.Add(new FileResult(FileType.Payment, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
-            logger.LogError(ex, "[SFTP] Orchestration {id} — person file upload failed after retries.", id);
-            fileResults.Add(new FileResult(FileType.Person, Succeeded: false, ErrorMessage: ex.Message));
+            logger.LogError(ex, "[SFTP] Orchestration {id} — payment file upload failed after retries.", id);
+            fileResults.Add(new FileResult(FileType.Payment, Succeeded: false, ErrorMessage: ex.Message));
         }
 
-        logger.LogInformation("[SFTP] Orchestration {id} — uploading address file to SFTP server...", id);
+        logger.LogInformation("[SFTP] Orchestration {id} — uploading GL file to SFTP server...", id);
         try
         {
             await context.CallActivityAsync<string>(nameof(UploadFile),
-                new UploadFileInput(addressFileName, addressContent), UploadRetryOptions);
-            fileResults.Add(new FileResult(FileType.Address, Succeeded: true, ErrorMessage: null));
+                new UploadFileInput(glFileName, glContent), UploadRetryOptions);
+            fileResults.Add(new FileResult(FileType.GeneralLedger, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
-            logger.LogError(ex, "[SFTP] Orchestration {id} — address file upload failed after retries.", id);
-            fileResults.Add(new FileResult(FileType.Address, Succeeded: false, ErrorMessage: ex.Message));
+            logger.LogError(ex, "[SFTP] Orchestration {id} — GL file upload failed after retries.", id);
+            fileResults.Add(new FileResult(FileType.GeneralLedger, Succeeded: false, ErrorMessage: ex.Message));
         }
 
         // Send callback to coordinator with per-file results.
@@ -109,50 +109,50 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         bool allSucceeded = fileResults.All(f => f.Succeeded);
         logger.LogInformation("[SFTP] Orchestration {id} — complete (allSucceeded={allSucceeded}).", id, allSucceeded);
         return allSucceeded
-            ? $"Uploaded 2 files: {personFileName}, {addressFileName}."
+            ? $"Uploaded 2 files: {paymentFileName}, {glFileName}."
             : $"Partial failure: {string.Join(", ", fileResults.Where(f => !f.Succeeded).Select(f => f.FileType))}";
     }
 
     // --- Activity inputs ---
 
-    public record CreatePersonFileInput(string BatchId, List<BatchItem> Items);
-    public record CreateAddressFileInput(string BatchId, List<BatchItem> Items);
+    public record CreatePaymentFileInput(string BatchId, List<PaymentData> Payments);
+    public record CreateGLFileInput(string BatchId, List<PaymentData> Payments);
     public record UploadFileInput(string FileName, string Content);
     public record SendCallbackInput(string CallbackUrl, SftpBatchResult Result);
 
     // --- Activities ---
 
-    /// <summary>Activity that builds a combined person CSV from all batch items.</summary>
-    [Function(nameof(CreatePersonFile))]
-    public static string CreatePersonFile([ActivityTrigger] CreatePersonFileInput input, FunctionContext executionContext)
+    /// <summary>Activity that builds a payment CSV from all batch payments.</summary>
+    [Function(nameof(CreatePaymentFile))]
+    public static string CreatePaymentFile([ActivityTrigger] CreatePaymentFileInput input, FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger(nameof(CreatePersonFile));
+        ILogger logger = executionContext.GetLogger(nameof(CreatePaymentFile));
 
         var sb = new StringBuilder();
-        sb.AppendLine("ItemId,FirstName,LastName,DateOfBirth");
-        foreach (var item in input.Items)
+        sb.AppendLine("PaymentId,PayorName,PayeeName,Amount,AccountNumber,RoutingNumber,PaymentDate");
+        foreach (var payment in input.Payments)
         {
-            sb.AppendLine($"{CsvEscape(item.ItemId)},{CsvEscape(item.Person.FirstName)},{CsvEscape(item.Person.LastName)},{CsvEscape(item.Person.DateOfBirth)}");
+            sb.AppendLine($"{CsvEscape(payment.PaymentId)},{CsvEscape(payment.PayorName)},{CsvEscape(payment.PayeeName)},{payment.Amount.ToString("F2")},{CsvEscape(payment.AccountNumber)},{CsvEscape(payment.RoutingNumber)},{CsvEscape(payment.PaymentDate)}");
         }
 
-        logger.LogInformation("[SFTP] Created person CSV for batch {batchId} ({count} items).", input.BatchId, input.Items.Count);
+        logger.LogInformation("[SFTP] Created payment CSV for batch {batchId} ({count} payments).", input.BatchId, input.Payments.Count);
         return sb.ToString();
     }
 
-    /// <summary>Activity that builds a combined address CSV from all batch items.</summary>
-    [Function(nameof(CreateAddressFile))]
-    public static string CreateAddressFile([ActivityTrigger] CreateAddressFileInput input, FunctionContext executionContext)
+    /// <summary>Activity that builds a GL CSV from all batch payments (omits sensitive banking fields).</summary>
+    [Function(nameof(CreateGLFile))]
+    public static string CreateGLFile([ActivityTrigger] CreateGLFileInput input, FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger(nameof(CreateAddressFile));
+        ILogger logger = executionContext.GetLogger(nameof(CreateGLFile));
 
         var sb = new StringBuilder();
-        sb.AppendLine("ItemId,Street,City,State,ZipCode");
-        foreach (var item in input.Items)
+        sb.AppendLine("PaymentId,PayorName,PayeeName,Amount,PaymentDate");
+        foreach (var payment in input.Payments)
         {
-            sb.AppendLine($"{CsvEscape(item.ItemId)},{CsvEscape(item.Address.Street)},{CsvEscape(item.Address.City)},{CsvEscape(item.Address.State)},{CsvEscape(item.Address.ZipCode)}");
+            sb.AppendLine($"{CsvEscape(payment.PaymentId)},{CsvEscape(payment.PayorName)},{CsvEscape(payment.PayeeName)},{payment.Amount.ToString("F2")},{CsvEscape(payment.PaymentDate)}");
         }
 
-        logger.LogInformation("[SFTP] Created address CSV for batch {batchId} ({count} items).", input.BatchId, input.Items.Count);
+        logger.LogInformation("[SFTP] Created GL CSV for batch {batchId} ({count} payments).", input.BatchId, input.Payments.Count);
         return sb.ToString();
     }
 

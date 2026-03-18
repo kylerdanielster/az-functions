@@ -24,7 +24,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
     /// <summary>
     /// Accepts an SFTP batch processing request, validates required fields, drops it onto a
     /// Storage Queue, and returns 202 Accepted. Returns 400 if the body is null or
-    /// if BatchId, CallbackUrl, or Items are missing/empty.
+    /// if BatchId, CallbackUrl, or Payments are missing/empty.
     /// Route: POST /api/sftp/process
     /// </summary>
     [Function(nameof(ReceiveSftpRequest))]
@@ -44,22 +44,22 @@ public class SftpProcessor(IMessageQueue messageQueue)
 
         if (string.IsNullOrWhiteSpace(request.BatchId) ||
             string.IsNullOrWhiteSpace(request.CallbackUrl) ||
-            request.Items is null ||
-            request.Items.Count == 0)
+            request.Payments is null ||
+            request.Payments.Count == 0)
         {
             var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
-            await badRequest.WriteStringAsync("Missing required fields: BatchId, CallbackUrl, and Items (non-empty) are required.");
+            await badRequest.WriteStringAsync("Missing required fields: BatchId, CallbackUrl, and Payments (non-empty) are required.");
             return badRequest;
         }
 
         string message = JsonSerializer.Serialize(request, JsonOptions);
         await messageQueue.SendMessageAsync(message);
 
-        logger.LogInformation("[SFTP] Queued batch processing request for batch {batchId} ({itemCount} items).",
-            request.BatchId, request.Items.Count);
+        logger.LogInformation("[SFTP] Queued batch processing request for batch {batchId} ({paymentCount} payments).",
+            request.BatchId, request.Payments.Count);
 
         var response = req.CreateResponse(HttpStatusCode.Accepted);
-        await response.WriteAsJsonAsync(new { request.BatchId, ItemCount = request.Items.Count, status = BatchStatus.Queued });
+        await response.WriteAsJsonAsync(new { request.BatchId, PaymentCount = request.Payments.Count, status = BatchStatus.Processing });
         return response;
     }
 
@@ -80,8 +80,8 @@ public class SftpProcessor(IMessageQueue messageQueue)
 
         string instanceId = $"sftp-{request.BatchId}";
 
-        logger.LogInformation("[SFTP] Starting orchestration {instanceId} for batch {batchId} ({itemCount} items).",
-            instanceId, request.BatchId, request.Items.Count);
+        logger.LogInformation("[SFTP] Starting orchestration {instanceId} for batch {batchId} ({paymentCount} payments).",
+            instanceId, request.BatchId, request.Payments.Count);
 
         await durableClient.ScheduleNewOrchestrationInstanceAsync(
             nameof(SftpOrchestration),

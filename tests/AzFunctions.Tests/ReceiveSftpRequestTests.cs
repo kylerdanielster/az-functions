@@ -15,9 +15,8 @@ public class ReceiveSftpRequestTests
     public async Task ValidRequest_Returns202AndQueuesMessage()
     {
         var body = new SftpBatchRequest("batch1", [
-            new BatchItem("item-000",
-                new PersonData("John", "Doe", "1990-01-01"),
-                new AddressData("123 Main St", "Springfield", "IL", "62701"))
+            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
+                "1234567890", "021000021", "2026-03-15")
         ], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
@@ -42,9 +41,8 @@ public class ReceiveSftpRequestTests
     public async Task MissingBatchId_Returns400()
     {
         var body = new SftpBatchRequest("", [
-            new BatchItem("item-000",
-                new PersonData("John", "Doe", "1990-01-01"),
-                new AddressData("123 Main St", "Springfield", "IL", "62701"))
+            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
+                "1234567890", "021000021", "2026-03-15")
         ], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
@@ -55,7 +53,7 @@ public class ReceiveSftpRequestTests
     }
 
     [Fact]
-    public async Task EmptyItems_Returns400()
+    public async Task EmptyPayments_Returns400()
     {
         var body = new SftpBatchRequest("batch1", [], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);

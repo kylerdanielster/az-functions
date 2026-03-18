@@ -13,7 +13,7 @@ public class GenerateBatchTests
     private SftpDataFeed CreateDataFeed() => new(httpClientFactory, batchTracker);
 
     [Fact]
-    public async Task SubmitSucceeds_CreatesBatchAndFiles()
+    public async Task SubmitSucceeds_CreatesBatchFilesAndPayments()
     {
         Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", "http://localhost:7071");
         Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", "http://localhost:7071");
@@ -28,8 +28,9 @@ public class GenerateBatchTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         await batchTracker.Received(1).CreateBatchAsync(Arg.Any<string>(), 10);
-        await batchTracker.Received(1).CreateFileAsync(Arg.Any<string>(), FileType.Person);
-        await batchTracker.Received(1).CreateFileAsync(Arg.Any<string>(), FileType.Address);
+        await batchTracker.Received(1).CreateFileAsync(Arg.Any<string>(), FileType.Payment);
+        await batchTracker.Received(1).CreateFileAsync(Arg.Any<string>(), FileType.GeneralLedger);
+        await batchTracker.Received(10).CreatePaymentAsync(Arg.Any<string>(), Arg.Any<string>());
         // No failures — CompleteBatchFromResultsAsync should not be called
         await batchTracker.DidNotReceive().CompleteBatchFromResultsAsync(Arg.Any<string>(), Arg.Any<List<FileResult>>());
     }
@@ -52,8 +53,8 @@ public class GenerateBatchTests
         await batchTracker.Received(1).CompleteBatchFromResultsAsync(Arg.Any<string>(),
             Arg.Is<List<FileResult>>(f =>
                 f.Count == 2 &&
-                !f[0].Succeeded && f[0].FileType == FileType.Person &&
-                !f[1].Succeeded && f[1].FileType == FileType.Address));
+                !f[0].Succeeded && f[0].FileType == FileType.Payment &&
+                !f[1].Succeeded && f[1].FileType == FileType.GeneralLedger));
     }
 }
 

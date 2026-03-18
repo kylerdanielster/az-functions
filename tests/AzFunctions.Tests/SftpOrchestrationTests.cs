@@ -7,14 +7,12 @@ namespace AzFunctions.Tests;
 
 public class SftpOrchestrationTests
 {
-    private static List<BatchItem> CreateTestItems() =>
+    private static List<PaymentData> CreateTestPayments() =>
     [
-        new BatchItem("item-000",
-            new PersonData("John", "Doe", "1990-01-01"),
-            new AddressData("123 Main St", "Springfield", "IL", "62701")),
-        new BatchItem("item-001",
-            new PersonData("Jane", "Smith", "1985-06-15"),
-            new AddressData("456 Oak Ave", "Chicago", "IL", "60601"))
+        new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
+            "1234567890", "021000021", "2026-03-15"),
+        new PaymentData("pmt-001", "Jane Smith", "Globex Inc", 2750.50m,
+            "9876543210", "021000089", "2026-03-14")
     ];
 
     [Fact]
@@ -24,13 +22,13 @@ public class SftpOrchestrationTests
         context.InstanceId.Returns("sftp-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
         context.GetInput<SftpBatchRequest>().Returns(new SftpBatchRequest(
-            "batch1", CreateTestItems(), "http://localhost/callback"));
+            "batch1", CreateTestPayments(), "http://localhost/callback"));
 
         // File content creation succeeds
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePersonFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
-            .Returns("ItemId,FirstName,LastName,DateOfBirth\nitem-000,John,Doe,1990-01-01\n");
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateAddressFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
-            .Returns("ItemId,Street,City,State,ZipCode\nitem-000,123 Main St,Springfield,IL,62701\n");
+        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+            .Returns("PaymentId,PayorName,PayeeName,Amount,AccountNumber,RoutingNumber,PaymentDate\npmt-000,John Doe,Acme Corp,1500.00,1234567890,021000021,2026-03-15\n");
+        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+            .Returns("PaymentId,PayorName,PayeeName,Amount,PaymentDate\npmt-000,John Doe,Acme Corp,1500.00,2026-03-15\n");
 
         // Uploads succeed
         context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
@@ -53,24 +51,24 @@ public class SftpOrchestrationTests
         context.InstanceId.Returns("sftp-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
         context.GetInput<SftpBatchRequest>().Returns(new SftpBatchRequest(
-            "batch1", CreateTestItems(), "http://localhost/callback"));
+            "batch1", CreateTestPayments(), "http://localhost/callback"));
 
         // File content creation succeeds
-        string personContent = "ItemId,FirstName,LastName,DateOfBirth\nitem-000,John,Doe,1990-01-01\n";
-        string addressContent = "ItemId,Street,City,State,ZipCode\nitem-000,123 Main St,Springfield,IL,62701\n";
+        string paymentContent = "PaymentId,PayorName,PayeeName,Amount,AccountNumber,RoutingNumber,PaymentDate\npmt-000,John Doe,Acme Corp,1500.00,1234567890,021000021,2026-03-15\n";
+        string glContent = "PaymentId,PayorName,PayeeName,Amount,PaymentDate\npmt-000,John Doe,Acme Corp,1500.00,2026-03-15\n";
 
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePersonFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
-            .Returns(personContent);
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateAddressFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
-            .Returns(addressContent);
+        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+            .Returns(paymentContent);
+        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+            .Returns(glContent);
 
-        // Person upload fails, address upload succeeds.
-        var personInput = new SftpOrchestration.UploadFileInput("person_batch1.csv", personContent);
-        var addressInput = new SftpOrchestration.UploadFileInput("address_batch1.csv", addressContent);
+        // Payment upload fails, GL upload succeeds.
+        var paymentInput = new SftpOrchestration.UploadFileInput("payment_batch1.csv", paymentContent);
+        var glInput = new SftpOrchestration.UploadFileInput("gl_batch1.csv", glContent);
 
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), personInput, Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), paymentInput, Arg.Any<TaskOptions>())
             .ThrowsAsync(new TaskFailedException("UploadFile", 1, new ApplicationException("SFTP connection failed")));
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), addressInput, Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), glInput, Arg.Any<TaskOptions>())
             .Returns("Uploaded.");
 
         // Callback succeeds
@@ -80,6 +78,6 @@ public class SftpOrchestrationTests
         string result = await SftpOrchestration.RunOrchestrator(context);
 
         Assert.Contains("Partial failure", result);
-        Assert.Contains(FileType.Person, result);
+        Assert.Contains(FileType.Payment, result);
     }
 }

@@ -16,8 +16,8 @@ public class BatchCompletedTests
     public async Task ValidCallback_CallsCompleteBatchFromResults()
     {
         var result = new SftpBatchResult("batch1", [
-            new FileResult(FileType.Person, true, null),
-            new FileResult(FileType.Address, true, null)
+            new FileResult(FileType.Payment, true, null),
+            new FileResult(FileType.GeneralLedger, true, null)
         ]);
         var req = FakeHttpRequestData.CreateWithJson(context, result);
 
@@ -39,11 +39,11 @@ public class BatchCompletedTests
     }
 
     [Fact]
-    public async Task PartialFailure_CallsCompleteBatchFromResults()
+    public async Task GLFileFailed_CallsCompleteBatchFromResults()
     {
         var result = new SftpBatchResult("batch1", [
-            new FileResult(FileType.Person, true, null),
-            new FileResult(FileType.Address, false, "SFTP connection failed")
+            new FileResult(FileType.Payment, true, null),
+            new FileResult(FileType.GeneralLedger, false, "SFTP connection failed")
         ]);
         var req = FakeHttpRequestData.CreateWithJson(context, result);
 
