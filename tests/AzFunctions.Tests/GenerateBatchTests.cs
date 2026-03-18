@@ -13,10 +13,15 @@ public class GenerateBatchTests
     private SftpDataFeed CreateDataFeed() => new(httpClientFactory, batchTracker);
 
     [Fact]
-    public async Task SubmitSucceeds_CreatesBatchFilesAndPayments()
+    public async Task SubmitSucceeds_CreatesBatchAndPayments()
     {
         Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", "http://localhost:7071");
         Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", "http://localhost:7071");
+
+        batchTracker.GetQueuedPaymentsAsync(Arg.Any<string>()).Returns(
+        [
+            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15")
+        ]);
 
         var handler = new FakeHttpMessageHandler(HttpStatusCode.Accepted);
         var httpClient = new HttpClient(handler);
@@ -28,18 +33,22 @@ public class GenerateBatchTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         await batchTracker.Received(1).CreateBatchAsync(Arg.Any<string>(), 10);
-        await batchTracker.Received(1).CreateFileAsync(Arg.Any<string>(), FileType.Payment);
-        await batchTracker.Received(1).CreateFileAsync(Arg.Any<string>(), FileType.GeneralLedger);
-        await batchTracker.Received(10).CreatePaymentAsync(Arg.Any<string>(), Arg.Any<string>());
-        // No failures — CompleteBatchFromResultsAsync should not be called
-        await batchTracker.DidNotReceive().CompleteBatchFromResultsAsync(Arg.Any<string>(), Arg.Any<List<FileResult>>());
+        await batchTracker.Received(10).CreatePaymentAsync(Arg.Any<string>(), Arg.Any<PaymentData>());
+        await batchTracker.Received(1).GetQueuedPaymentsAsync(Arg.Any<string>());
+        // No failures — UpdateBatchStatusAsync should not be called
+        await batchTracker.DidNotReceive().UpdateBatchStatusAsync(Arg.Any<string>(), Arg.Any<string>());
     }
 
     [Fact]
-    public async Task SubmitFails_MarksBothFilesFailed()
+    public async Task SubmitFails_MarksBatchAsError()
     {
         Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", "http://localhost:7071");
         Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", "http://localhost:7071");
+
+        batchTracker.GetQueuedPaymentsAsync(Arg.Any<string>()).Returns(
+        [
+            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15")
+        ]);
 
         var handler = new FakeHttpMessageHandler(HttpStatusCode.InternalServerError, failAll: true);
         var httpClient = new HttpClient(handler);
@@ -50,11 +59,7 @@ public class GenerateBatchTests
         var response = await CreateDataFeed().TriggerDataFeed(req, context);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        await batchTracker.Received(1).CompleteBatchFromResultsAsync(Arg.Any<string>(),
-            Arg.Is<List<FileResult>>(f =>
-                f.Count == 2 &&
-                !f[0].Succeeded && f[0].FileType == FileType.Payment &&
-                !f[1].Succeeded && f[1].FileType == FileType.GeneralLedger));
+        await batchTracker.Received(1).UpdateBatchStatusAsync(Arg.Any<string>(), BatchStatus.Error);
     }
 }
 

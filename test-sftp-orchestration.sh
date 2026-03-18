@@ -50,16 +50,10 @@ for i in $(seq 1 60); do
   STATUS_RESPONSE=$(curl -s "$BASE_URL/batch/$BATCH_ID")
 
   BATCH_STATUS=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Status','Unknown'))" 2>/dev/null || echo "Unknown")
-  FILES_DONE=$(echo "$STATUS_RESPONSE" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-files = d.get('Files', [])
-print(len([f for f in files if f.get('Status') in ('Processed','Failed','PaymentFileFailed','GLFileFailed')]))" 2>/dev/null || echo "0")
-  FILES_TOTAL=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('Files', [])))" 2>/dev/null || echo "0")
 
-  echo "  Poll $i: $FILES_DONE/$FILES_TOTAL files done (batch: $BATCH_STATUS)"
+  echo "  Poll $i: batch status=$BATCH_STATUS"
 
-  if [ "$BATCH_STATUS" = "Processed" ] || [ "$BATCH_STATUS" = "PaymentFileFailed" ] || [ "$BATCH_STATUS" = "GLFileFailed" ] || [ "$BATCH_STATUS" = "Failed" ]; then
+  if [ "$BATCH_STATUS" = "Processed" ] || [ "$BATCH_STATUS" = "Error" ]; then
     FINAL_STATUS="$BATCH_STATUS"
     echo ""
     echo "  Batch $BATCH_STATUS!"
@@ -72,26 +66,6 @@ print(len([f for f in files if f.get('Status') in ('Processed','Failed','Payment
     echo "  TIMEOUT after 3 minutes"
   fi
 done
-echo ""
-
-# Display file status table from Table Storage
-echo "  File Status (from BatchTracking table):"
-echo "  -------------------------------------------"
-echo "$STATUS_RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-for f in d.get('Files', []):
-    file_type = f.get('FileType', '')
-    status = f.get('Status', 'Unknown')
-    completed = f.get('CompletedAt', '')
-    error = f.get('ErrorMessage', '')
-    if completed:
-        completed = completed[:19]
-    line = f'  {file_type:<12} {status:<12} {completed}'
-    if error:
-        line += f'  ERROR: {error}'
-    print(line)
-"
 echo ""
 
 # Display payment status from Table Storage
@@ -140,14 +114,6 @@ echo "============================================"
 echo "  Summary"
 echo "============================================"
 
-PROCESSED_FILE_ENTITIES=$(echo "$STATUS_RESPONSE" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-print(len([f for f in d.get('Files', []) if f.get('Status') == 'Processed']))" 2>/dev/null || echo "0")
-FAILED_FILE_ENTITIES=$(echo "$STATUS_RESPONSE" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-print(len([f for f in d.get('Files', []) if f.get('Status') == 'Failed']))" 2>/dev/null || echo "0")
 PAYMENT_ENTITIES=$(echo "$STATUS_RESPONSE" | python3 -c "
 import sys,json
 d = json.load(sys.stdin)
@@ -155,12 +121,11 @@ print(len(d.get('Payments', [])))" 2>/dev/null || echo "0")
 
 echo ""
 echo "  Batch:  $FINAL_STATUS"
-echo "  Files (tracking):  $PROCESSED_FILE_ENTITIES processed, $FAILED_FILE_ENTITIES failed"
 echo "  Files (SFTP):  $FILE_COUNT uploaded ($PAYMENT_COUNT payment + $GL_COUNT gl)"
 echo "  Payments tracked:  $PAYMENT_ENTITIES"
 echo ""
 
-if [ "$FINAL_STATUS" = "Processed" ] && [ "$FILE_COUNT" -ge 2 ] && [ "$PROCESSED_FILE_ENTITIES" -ge 2 ] && [ "$FAILED_FILE_ENTITIES" -eq 0 ] && [ "$PAYMENT_ENTITIES" -ge 10 ]; then
+if [ "$FINAL_STATUS" = "Processed" ] && [ "$FILE_COUNT" -ge 2 ] && [ "$PAYMENT_ENTITIES" -ge 10 ]; then
   echo "  Result: PASS"
 else
   echo "  Result: FAIL"

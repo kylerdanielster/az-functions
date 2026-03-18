@@ -38,6 +38,18 @@ builder.Services.AddSingleton<IMessageQueue>(sp =>
     return new StorageQueueClient(queueClient);
 });
 
+builder.Services.AddSingleton<IGLErrorQueue>(sp =>
+{
+    string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
+        ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
+    var queueClient = new QueueClient(connectionString, SftpProcessor.GLErrorQueueName, new QueueClientOptions
+    {
+        MessageEncoding = QueueMessageEncoding.Base64
+    });
+    queueClient.CreateIfNotExists();
+    return new GLErrorQueueClient(queueClient);
+});
+
 var app = builder.Build();
 
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();

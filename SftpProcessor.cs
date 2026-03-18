@@ -11,10 +11,12 @@ namespace AzFunctions;
 /// <summary>
 /// SFTP Processor (App 2) entry points. Validates and accepts batch processing requests over HTTP,
 /// queues them via <see cref="IMessageQueue"/> for reliable delivery, and starts Durable Functions orchestrations.
+/// Also processes GL error queue messages for failed GL uploads.
 /// </summary>
 public class SftpProcessor(IMessageQueue messageQueue)
 {
     public const string QueueName = "sftp-processing-queue";
+    public const string GLErrorQueueName = "gl-error-queue";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -59,7 +61,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
             request.BatchId, request.Payments.Count);
 
         var response = req.CreateResponse(HttpStatusCode.Accepted);
-        await response.WriteAsJsonAsync(new { request.BatchId, PaymentCount = request.Payments.Count, status = BatchStatus.Processing });
+        await response.WriteAsJsonAsync(new { request.BatchId, PaymentCount = request.Payments.Count, status = BatchStatus.Queued });
         return response;
     }
 
@@ -87,5 +89,30 @@ public class SftpProcessor(IMessageQueue messageQueue)
             nameof(SftpOrchestration),
             request,
             new StartOrchestrationOptions { InstanceId = instanceId });
+    }
+
+    /// <summary>
+    /// Queue trigger that processes failed GL upload messages from the GL error queue.
+    /// Logs the failure for visibility. Future: implement manual retry endpoint.
+    /// </summary>
+    [Function(nameof(ProcessGLErrorQueue))]
+    public static void ProcessGLErrorQueue(
+        [QueueTrigger(GLErrorQueueName)] string messageText,
+        FunctionContext executionContext)
+    {
+        ILogger logger = executionContext.GetLogger(nameof(ProcessGLErrorQueue));
+
+        var errorMessage = JsonSerializer.Deserialize<SftpOrchestration.GLErrorMessage>(messageText, JsonOptions);
+        if (errorMessage is null)
+        {
+            logger.LogError("[SFTP] Failed to deserialize GL error queue message.");
+            return;
+        }
+
+        logger.LogWarning("[SFTP] GL file upload failed for batch {batchId}: {error}",
+            errorMessage.BatchId, errorMessage.ErrorMessage);
+
+        // TODO: Send error email notification
+        // TODO: Implement manual retry endpoint
     }
 }

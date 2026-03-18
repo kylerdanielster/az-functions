@@ -13,19 +13,15 @@ public class BatchCompletedTests
     private SftpDataFeed CreateDataFeed() => new(httpClientFactory, batchTracker);
 
     [Fact]
-    public async Task ValidCallback_CallsCompleteBatchFromResults()
+    public async Task ProcessedCallback_UpdatesBatchStatus()
     {
-        var result = new SftpBatchResult("batch1", [
-            new FileResult(FileType.Payment, true, null),
-            new FileResult(FileType.GeneralLedger, true, null)
-        ]);
-        var req = FakeHttpRequestData.CreateWithJson(context, result);
+        var callback = new SftpBatchCallback("batch1", BatchStatus.Processed);
+        var req = FakeHttpRequestData.CreateWithJson(context, callback);
 
         var response = await CreateDataFeed().BatchCompleted(req, context);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        await batchTracker.Received(1).CompleteBatchFromResultsAsync("batch1",
-            Arg.Is<List<FileResult>>(f => f.Count == 2));
+        await batchTracker.Received(1).UpdateBatchStatusAsync("batch1", BatchStatus.Processed);
     }
 
     [Fact]
@@ -39,18 +35,26 @@ public class BatchCompletedTests
     }
 
     [Fact]
-    public async Task GLFileFailed_CallsCompleteBatchFromResults()
+    public async Task ErrorCallback_UpdatesBatchStatus()
     {
-        var result = new SftpBatchResult("batch1", [
-            new FileResult(FileType.Payment, true, null),
-            new FileResult(FileType.GeneralLedger, false, "SFTP connection failed")
-        ]);
-        var req = FakeHttpRequestData.CreateWithJson(context, result);
+        var callback = new SftpBatchCallback("batch1", BatchStatus.Error);
+        var req = FakeHttpRequestData.CreateWithJson(context, callback);
 
         var response = await CreateDataFeed().BatchCompleted(req, context);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        await batchTracker.Received(1).CompleteBatchFromResultsAsync("batch1",
-            Arg.Is<List<FileResult>>(f => f.Count == 2 && !f[1].Succeeded));
+        await batchTracker.Received(1).UpdateBatchStatusAsync("batch1", BatchStatus.Error);
+    }
+
+    [Fact]
+    public async Task ProcessingCallback_UpdatesBatchStatus()
+    {
+        var callback = new SftpBatchCallback("batch1", BatchStatus.Processing);
+        var req = FakeHttpRequestData.CreateWithJson(context, callback);
+
+        var response = await CreateDataFeed().BatchCompleted(req, context);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await batchTracker.Received(1).UpdateBatchStatusAsync("batch1", BatchStatus.Processing);
     }
 }

@@ -9,13 +9,16 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// SFTP Processor (App 2) orchestration and activities. Generates payment and GL CSV
-/// files from all batch payments and uploads each independently to the SFTP server with retry
-/// (per-file error isolation). Sends a completion callback with per-file results to the Coordinator.
-/// Callback failure is isolated from file uploads — see <see cref="RunOrchestrator"/>.
+/// SFTP Processor (App 2) orchestration and activities. Processes files sequentially:
+/// payment file first, then GL file only if payment succeeds. Sends callbacks at each stage.
+/// GL failures are queued to the GL error queue for manual retry — no callback is sent,
+/// so App 1 stays in Processing until the GL is retried and succeeds.
 /// </summary>
-public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory)
+public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory, IGLErrorQueue glErrorQueue)
 {
+    private const string PaymentFileType = "payment";
+    private const string GLFileType = "gl";
+
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
         maxNumberOfAttempts: 3,
         firstRetryInterval: TimeSpan.FromSeconds(5)));
@@ -30,11 +33,11 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     };
 
     /// <summary>
-    /// Durable Functions orchestrator. Generates payment and GL CSV files in parallel
-    /// from all batch payments, then uploads each from memory to SFTP with retry. Each file has its
-    /// own try/catch so a failure in one doesn't prevent the other. Sends a callback with per-file results.
-    /// Callback failure is isolated — if the callback fails after retries, the orchestration
-    /// still completes (files are already uploaded).
+    /// Durable Functions orchestrator. Processes files sequentially: payment file first, then GL.
+    /// If payment fails → callback Error, return early (no GL attempt).
+    /// If payment succeeds → callback Processing, then attempt GL.
+    /// If GL succeeds → callback Processed.
+    /// If GL fails → queue to GL error queue, no callback (App 1 stays in Processing).
     /// </summary>
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
@@ -49,68 +52,96 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, {paymentCount} payments.",
             id, request.BatchId, request.Payments.Count);
 
-        // Create file content in parallel
-        logger.LogInformation("[SFTP] Orchestration {id} — creating CSV files...", id);
-        var paymentContentTask = context.CallActivityAsync<string>(nameof(CreatePaymentFile),
+        // Step 1: Create and upload payment file
+        logger.LogInformation("[SFTP] Orchestration {id} — creating payment CSV...", id);
+        string paymentContent = await context.CallActivityAsync<string>(nameof(CreatePaymentFile),
             new CreatePaymentFileInput(request.BatchId, request.Payments));
-        var glContentTask = context.CallActivityAsync<string>(nameof(CreateGLFile),
-            new CreateGLFileInput(request.BatchId, request.Payments));
-        await Task.WhenAll(paymentContentTask, glContentTask);
-
-        string paymentContent = paymentContentTask.Result;
-        string glContent = glContentTask.Result;
 
         string paymentFileName = $"payment_{request.BatchId}.csv";
-        string glFileName = $"gl_{request.BatchId}.csv";
-
-        // Upload each file independently — a failure in one doesn't prevent the other
-        var fileResults = new List<FileResult>();
 
         logger.LogInformation("[SFTP] Orchestration {id} — uploading payment file to SFTP server...", id);
         try
         {
             await context.CallActivityAsync<string>(nameof(UploadFile),
                 new UploadFileInput(paymentFileName, paymentContent), UploadRetryOptions);
-            fileResults.Add(new FileResult(FileType.Payment, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
             logger.LogError(ex, "[SFTP] Orchestration {id} — payment file upload failed after retries.", id);
-            fileResults.Add(new FileResult(FileType.Payment, Succeeded: false, ErrorMessage: ex.Message));
+
+            try
+            {
+                await context.CallActivityAsync(nameof(SendCallback),
+                    new SendCallbackInput(request.CallbackUrl, new SftpBatchCallback(request.BatchId, BatchStatus.Error)),
+                    CallbackRetryOptions);
+            }
+            catch (TaskFailedException cbEx)
+            {
+                logger.LogError(cbEx, "[SFTP] Orchestration {id} — Error callback failed after retries.", id);
+            }
+
+            return $"Payment file upload failed: {ex.Message}";
         }
+
+        // Step 2: Payment succeeded — send Processing callback
+        logger.LogInformation("[SFTP] Orchestration {id} — payment file uploaded, sending Processing callback...", id);
+        try
+        {
+            await context.CallActivityAsync(nameof(SendCallback),
+                new SendCallbackInput(request.CallbackUrl, new SftpBatchCallback(request.BatchId, BatchStatus.Processing)),
+                CallbackRetryOptions);
+        }
+        catch (TaskFailedException ex)
+        {
+            logger.LogError(ex, "[SFTP] Orchestration {id} — Processing callback failed after retries.", id);
+        }
+
+        // Step 3: Create and upload GL file
+        logger.LogInformation("[SFTP] Orchestration {id} — creating GL CSV...", id);
+        string glContent = await context.CallActivityAsync<string>(nameof(CreateGLFile),
+            new CreateGLFileInput(request.BatchId, request.Payments));
+
+        string glFileName = $"gl_{request.BatchId}.csv";
 
         logger.LogInformation("[SFTP] Orchestration {id} — uploading GL file to SFTP server...", id);
         try
         {
             await context.CallActivityAsync<string>(nameof(UploadFile),
                 new UploadFileInput(glFileName, glContent), UploadRetryOptions);
-            fileResults.Add(new FileResult(FileType.GeneralLedger, Succeeded: true, ErrorMessage: null));
         }
         catch (TaskFailedException ex)
         {
             logger.LogError(ex, "[SFTP] Orchestration {id} — GL file upload failed after retries.", id);
-            fileResults.Add(new FileResult(FileType.GeneralLedger, Succeeded: false, ErrorMessage: ex.Message));
+
+            // Queue for manual retry — no callback, App 1 stays in Processing
+            try
+            {
+                await context.CallActivityAsync(nameof(SendToGLErrorQueue),
+                    new GLErrorMessage(request.BatchId, request.Payments, request.CallbackUrl, ex.Message));
+            }
+            catch (TaskFailedException queueEx)
+            {
+                logger.LogError(queueEx, "[SFTP] Orchestration {id} — failed to queue GL error message.", id);
+            }
+
+            return $"Payment file uploaded. GL file upload failed: {ex.Message}";
         }
 
-        // Send callback to coordinator with per-file results.
-        // Callback failure is isolated — files are already uploaded successfully.
-        var result = new SftpBatchResult(request.BatchId, fileResults);
+        // Step 4: GL succeeded — send Processed callback
+        logger.LogInformation("[SFTP] Orchestration {id} — GL file uploaded, sending Processed callback...", id);
         try
         {
             await context.CallActivityAsync(nameof(SendCallback),
-                new SendCallbackInput(request.CallbackUrl, result), CallbackRetryOptions);
+                new SendCallbackInput(request.CallbackUrl, new SftpBatchCallback(request.BatchId, BatchStatus.Processed)),
+                CallbackRetryOptions);
         }
         catch (TaskFailedException ex)
         {
-            logger.LogError(ex, "[SFTP] Orchestration {id} — callback to {url} failed after retries. Files are uploaded but Coordinator was not notified.",
-                id, request.CallbackUrl);
+            logger.LogError(ex, "[SFTP] Orchestration {id} — Processed callback failed after retries.", id);
         }
 
-        bool allSucceeded = fileResults.All(f => f.Succeeded);
-        logger.LogInformation("[SFTP] Orchestration {id} — complete (allSucceeded={allSucceeded}).", id, allSucceeded);
-        return allSucceeded
-            ? $"Uploaded 2 files: {paymentFileName}, {glFileName}."
-            : $"Partial failure: {string.Join(", ", fileResults.Where(f => !f.Succeeded).Select(f => f.FileType))}";
+        logger.LogInformation("[SFTP] Orchestration {id} — complete.", id);
+        return $"Uploaded 2 files: {paymentFileName}, {glFileName}.";
     }
 
     // --- Activity inputs ---
@@ -118,7 +149,8 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     public record CreatePaymentFileInput(string BatchId, List<PaymentData> Payments);
     public record CreateGLFileInput(string BatchId, List<PaymentData> Payments);
     public record UploadFileInput(string FileName, string Content);
-    public record SendCallbackInput(string CallbackUrl, SftpBatchResult Result);
+    public record SendCallbackInput(string CallbackUrl, SftpBatchCallback Callback);
+    public record GLErrorMessage(string BatchId, List<PaymentData> Payments, string CallbackUrl, string ErrorMessage);
 
     // --- Activities ---
 
@@ -174,19 +206,31 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         return $"Uploaded {input.FileName} to {remoteFilePath}.";
     }
 
-    /// <summary>Activity that POSTs the processing result back to the Coordinator's callback URL.</summary>
+    /// <summary>Activity that POSTs the batch status callback to the Coordinator.</summary>
     [Function(nameof(SendCallback))]
     public async Task SendCallback([ActivityTrigger] SendCallbackInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(SendCallback));
 
         using var httpClient = httpClientFactory.CreateClient();
-        var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Result, JsonOptions);
+        var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Callback, JsonOptions);
         response.EnsureSuccessStatusCode();
 
-        int successCount = input.Result.Files.Count(f => f.Succeeded);
-        logger.LogInformation("[SFTP] Callback sent for batch {batchId} ({successCount}/{totalCount} files succeeded).",
-            input.Result.BatchId, successCount, input.Result.Files.Count);
+        logger.LogInformation("[SFTP] Callback sent for batch {batchId} — status={status}.",
+            input.Callback.BatchId, input.Callback.Status);
+    }
+
+    /// <summary>Activity that sends a failed GL upload message to the GL error queue for manual retry.</summary>
+    [Function(nameof(SendToGLErrorQueue))]
+    public async Task SendToGLErrorQueue([ActivityTrigger] GLErrorMessage input, FunctionContext executionContext)
+    {
+        ILogger logger = executionContext.GetLogger(nameof(SendToGLErrorQueue));
+
+        string message = JsonSerializer.Serialize(input, JsonOptions);
+        await glErrorQueue.SendMessageAsync(message);
+
+        logger.LogWarning("[SFTP] GL error queued for batch {batchId}: {error}",
+            input.BatchId, input.ErrorMessage);
     }
 
     private static string CsvEscape(string field)
