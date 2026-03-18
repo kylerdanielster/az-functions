@@ -26,7 +26,7 @@ public class SftpOrchestrationTests
     }
 
     [Fact]
-    public async Task FullSuccess_SendsProcessingThenProcessedCallbacks()
+    public async Task FullSuccess_SendsProcessedCallback()
     {
         var context = CreateMockContext();
 
@@ -40,17 +40,22 @@ public class SftpOrchestrationTests
         context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("Uploaded.");
 
-        // Callbacks succeed
-        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        // Capture callback inputs
+        var callbackInputs = new List<SftpOrchestration.SendCallbackInput>();
+        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Do<object>(o =>
+        {
+            if (o is SftpOrchestration.SendCallbackInput input) callbackInputs.Add(input);
+        }), Arg.Any<TaskOptions>())
             .Returns(Task.CompletedTask);
 
         string result = await SftpOrchestration.RunOrchestrator(context);
 
         Assert.Contains("Uploaded 2 files", result);
 
-        // Verify two callbacks: Processing then Processed
-        await context.Received(2).CallActivityAsync(nameof(SftpOrchestration.SendCallback),
-            Arg.Any<object>(), Arg.Any<TaskOptions>());
+        // Only one callback (Processed) — Processing is set by App 1
+        Assert.Single(callbackInputs);
+        Assert.Equal("batch1", callbackInputs[0].Callback.BatchId);
+        Assert.Equal(BatchStatus.Processed, callbackInputs[0].Callback.Status);
     }
 
     [Fact]
@@ -66,8 +71,12 @@ public class SftpOrchestrationTests
         context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .ThrowsAsync(new TaskFailedException("UploadFile", 1, new ApplicationException("SFTP connection failed")));
 
-        // Callback succeeds
-        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        // Capture callback inputs
+        var callbackInputs = new List<SftpOrchestration.SendCallbackInput>();
+        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Do<object>(o =>
+        {
+            if (o is SftpOrchestration.SendCallbackInput input) callbackInputs.Add(input);
+        }), Arg.Any<TaskOptions>())
             .Returns(Task.CompletedTask);
 
         string result = await SftpOrchestration.RunOrchestrator(context);
@@ -78,9 +87,10 @@ public class SftpOrchestrationTests
         await context.DidNotReceive().CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile),
             Arg.Any<object>(), Arg.Any<TaskOptions>());
 
-        // Only one callback (Error) — no Processing or Processed
-        await context.Received(1).CallActivityAsync(nameof(SftpOrchestration.SendCallback),
-            Arg.Any<object>(), Arg.Any<TaskOptions>());
+        // Only one callback (Error) with correct payload
+        Assert.Single(callbackInputs);
+        Assert.Equal("batch1", callbackInputs[0].Callback.BatchId);
+        Assert.Equal(BatchStatus.Error, callbackInputs[0].Callback.Status);
     }
 
     [Fact]
@@ -111,8 +121,8 @@ public class SftpOrchestrationTests
 
         Assert.Contains("GL file upload failed", result);
 
-        // Only one callback (Processing) — no Processed callback after GL failure
-        await context.Received(1).CallActivityAsync(nameof(SftpOrchestration.SendCallback),
+        // No callbacks — Processing is set by App 1, and no Processed after GL failure
+        await context.DidNotReceive().CallActivityAsync(nameof(SftpOrchestration.SendCallback),
             Arg.Any<object>(), Arg.Any<TaskOptions>());
 
         // GL error queued

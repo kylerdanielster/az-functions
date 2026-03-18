@@ -4,24 +4,41 @@ using NSubstitute;
 
 namespace AzFunctions.Tests;
 
-public class GenerateBatchTests
+public class GenerateBatchTests : IDisposable
 {
     private readonly IBatchTracker batchTracker = Substitute.For<IBatchTracker>();
     private readonly IHttpClientFactory httpClientFactory = Substitute.For<IHttpClientFactory>();
     private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpDataFeed.TriggerDataFeed));
 
+    private readonly string? originalProcessorUrl;
+    private readonly string? originalCoordinatorUrl;
+
+    public GenerateBatchTests()
+    {
+        originalProcessorUrl = Environment.GetEnvironmentVariable("PROCESSOR_BASE_URL");
+        originalCoordinatorUrl = Environment.GetEnvironmentVariable("COORDINATOR_BASE_URL");
+        Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", "http://localhost:7071");
+        Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", "http://localhost:7071");
+    }
+
+    public void Dispose()
+    {
+        Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", originalProcessorUrl);
+        Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", originalCoordinatorUrl);
+    }
+
     private SftpDataFeed CreateDataFeed() => new(httpClientFactory, batchTracker);
+
+    private static List<PaymentData> CreateTestPayments(int count = 10) =>
+        Enumerable.Range(0, count).Select(i =>
+            new PaymentData($"pmt-{i:D3}", $"Payor {i}", $"Payee {i}", 1000m + i,
+                $"ACCT{i:D6}", $"RTN{i:D6}", $"2026-03-{15 + (i % 15):D2}")).ToList();
 
     [Fact]
     public async Task SubmitSucceeds_CreatesBatchAndPayments()
     {
-        Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", "http://localhost:7071");
-        Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", "http://localhost:7071");
-
-        batchTracker.GetQueuedPaymentsAsync(Arg.Any<string>()).Returns(
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15")
-        ]);
+        var payments = CreateTestPayments(10);
+        batchTracker.GetQueuedPaymentsAsync(Arg.Any<string>()).Returns(payments);
 
         var handler = new FakeHttpMessageHandler(HttpStatusCode.Accepted);
         var httpClient = new HttpClient(handler);
@@ -35,20 +52,15 @@ public class GenerateBatchTests
         await batchTracker.Received(1).CreateBatchAsync(Arg.Any<string>(), 10);
         await batchTracker.Received(10).CreatePaymentAsync(Arg.Any<string>(), Arg.Any<PaymentData>());
         await batchTracker.Received(1).GetQueuedPaymentsAsync(Arg.Any<string>());
-        // No failures — UpdateBatchStatusAsync should not be called
-        await batchTracker.DidNotReceive().UpdateBatchStatusAsync(Arg.Any<string>(), Arg.Any<string>());
+        // Successful submit sets status to Processing
+        await batchTracker.Received(1).UpdateBatchStatusAsync(Arg.Any<string>(), BatchStatus.Processing);
     }
 
     [Fact]
     public async Task SubmitFails_MarksBatchAsError()
     {
-        Environment.SetEnvironmentVariable("PROCESSOR_BASE_URL", "http://localhost:7071");
-        Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", "http://localhost:7071");
-
-        batchTracker.GetQueuedPaymentsAsync(Arg.Any<string>()).Returns(
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15")
-        ]);
+        var payments = CreateTestPayments(10);
+        batchTracker.GetQueuedPaymentsAsync(Arg.Any<string>()).Returns(payments);
 
         var handler = new FakeHttpMessageHandler(HttpStatusCode.InternalServerError, failAll: true);
         var httpClient = new HttpClient(handler);
@@ -60,6 +72,8 @@ public class GenerateBatchTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         await batchTracker.Received(1).UpdateBatchStatusAsync(Arg.Any<string>(), BatchStatus.Error);
+        // Failed submit should not set Processing
+        await batchTracker.DidNotReceive().UpdateBatchStatusAsync(Arg.Any<string>(), BatchStatus.Processing);
     }
 }
 

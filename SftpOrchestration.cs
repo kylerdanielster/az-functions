@@ -16,9 +16,6 @@ namespace AzFunctions;
 /// </summary>
 public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory, IGLErrorQueue glErrorQueue)
 {
-    private const string PaymentFileType = "payment";
-    private const string GLFileType = "gl";
-
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
         maxNumberOfAttempts: 3,
         firstRetryInterval: TimeSpan.FromSeconds(5)));
@@ -35,9 +32,9 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     /// <summary>
     /// Durable Functions orchestrator. Processes files sequentially: payment file first, then GL.
     /// If payment fails → callback Error, return early (no GL attempt).
-    /// If payment succeeds → callback Processing, then attempt GL.
     /// If GL succeeds → callback Processed.
     /// If GL fails → queue to GL error queue, no callback (App 1 stays in Processing).
+    /// Note: Processing status is set by App 1 after successful submission — no callback needed.
     /// </summary>
     [Function(nameof(SftpOrchestration))]
     public static async Task<string> RunOrchestrator(
@@ -83,20 +80,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
             return $"Payment file upload failed: {ex.Message}";
         }
 
-        // Step 2: Payment succeeded — send Processing callback
-        logger.LogInformation("[SFTP] Orchestration {id} — payment file uploaded, sending Processing callback...", id);
-        try
-        {
-            await context.CallActivityAsync(nameof(SendCallback),
-                new SendCallbackInput(request.CallbackUrl, new SftpBatchCallback(request.BatchId, BatchStatus.Processing)),
-                CallbackRetryOptions);
-        }
-        catch (TaskFailedException ex)
-        {
-            logger.LogError(ex, "[SFTP] Orchestration {id} — Processing callback failed after retries.", id);
-        }
-
-        // Step 3: Create and upload GL file
+        // Step 2: Create and upload GL file
         logger.LogInformation("[SFTP] Orchestration {id} — creating GL CSV...", id);
         string glContent = await context.CallActivityAsync<string>(nameof(CreateGLFile),
             new CreateGLFileInput(request.BatchId, request.Payments));
@@ -127,7 +111,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
             return $"Payment file uploaded. GL file upload failed: {ex.Message}";
         }
 
-        // Step 4: GL succeeded — send Processed callback
+        // Step 3: GL succeeded — send Processed callback
         logger.LogInformation("[SFTP] Orchestration {id} — GL file uploaded, sending Processed callback...", id);
         try
         {
@@ -233,19 +217,20 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
             input.BatchId, input.ErrorMessage);
     }
 
-    private static string CsvEscape(string field)
+    /// <summary>
+    /// Escapes a field for CSV output. Wraps in double quotes if the field contains
+    /// commas, double quotes, or newlines. Existing double quotes are doubled per RFC 4180.
+    /// </summary>
+    internal static string CsvEscape(string field)
     {
         if (field.Contains(',') || field.Contains('"') || field.Contains('\n'))
             return $"\"{field.Replace("\"", "\"\"")}\"";
         return field;
     }
 
-    // --- SFTP Server Inspection Endpoints ---
+    // --- TEST/DEBUG ENDPOINTS: SFTP Server Inspection ---
 
-    /// <summary>
-    /// Testing: Deletes all files from the SFTP server's remote upload directory.
-    /// Route: DELETE /api/sftp/files
-    /// </summary>
+    // TEST/DEBUG ENDPOINT — Deletes all files from the SFTP server's remote upload directory.
     [Function("SftpOrchestration_DeleteAllFiles")]
     public async Task<HttpResponseData> DeleteAllFiles(
         [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "sftp/files")] HttpRequestData req,
@@ -253,28 +238,35 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     {
         ILogger logger = executionContext.GetLogger("SftpOrchestration_DeleteAllFiles");
 
-        using var client = await sftpClientFactory.CreateConnectedClientAsync();
-
-        var files = client.ListDirectory(sftpClientFactory.RemotePath)
-            .Where(f => !f.IsDirectory)
-            .ToList();
-
-        foreach (var file in files)
+        try
         {
-            client.DeleteFile($"{sftpClientFactory.RemotePath}/{file.Name}");
+            using var client = await sftpClientFactory.CreateConnectedClientAsync();
+
+            var files = client.ListDirectory(sftpClientFactory.RemotePath)
+                .Where(f => !f.IsDirectory)
+                .ToList();
+
+            foreach (var file in files)
+            {
+                client.DeleteFile($"{sftpClientFactory.RemotePath}/{file.Name}");
+            }
+
+            logger.LogInformation("[SFTP] Deleted {count} files from SFTP server.", files.Count);
+
+            var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+            await response.WriteAsJsonAsync(new { deleted = files.Count });
+            return response;
         }
-
-        logger.LogInformation("[SFTP] Deleted {count} files from SFTP server.", files.Count);
-
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        await response.WriteAsJsonAsync(new { deleted = files.Count });
-        return response;
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[SFTP] Failed to delete files from SFTP server.");
+            var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Failed to delete files from SFTP server.");
+            return error;
+        }
     }
 
-    /// <summary>
-    /// Testing: Lists all files on the SFTP server with name, size, and last modified time.
-    /// Route: GET /api/sftp/files
-    /// </summary>
+    // TEST/DEBUG ENDPOINT — Lists all files on the SFTP server with name, size, and last modified time.
     [Function("SftpOrchestration_ListFiles")]
     public async Task<HttpResponseData> ListFiles(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files")] HttpRequestData req,
@@ -282,24 +274,31 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     {
         ILogger logger = executionContext.GetLogger("SftpOrchestration_ListFiles");
 
-        using var client = await sftpClientFactory.CreateConnectedClientAsync();
+        try
+        {
+            using var client = await sftpClientFactory.CreateConnectedClientAsync();
 
-        var files = client.ListDirectory(sftpClientFactory.RemotePath)
-            .Where(f => !f.IsDirectory)
-            .Select(f => new { name = f.Name, size = f.Length, modified = f.LastWriteTime })
-            .ToList();
+            var files = client.ListDirectory(sftpClientFactory.RemotePath)
+                .Where(f => !f.IsDirectory)
+                .Select(f => new { name = f.Name, size = f.Length, modified = f.LastWriteTime })
+                .ToList();
 
-        logger.LogInformation("[SFTP] Listed {count} files on SFTP server.", files.Count);
+            logger.LogInformation("[SFTP] Listed {count} files on SFTP server.", files.Count);
 
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        await response.WriteAsJsonAsync(files);
-        return response;
+            var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+            await response.WriteAsJsonAsync(files);
+            return response;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[SFTP] Failed to list files on SFTP server.");
+            var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Failed to list files from SFTP server.");
+            return error;
+        }
     }
 
-    /// <summary>
-    /// Testing: Returns the contents of a specific file from the SFTP server.
-    /// Route: GET /api/sftp/files/{fileName}
-    /// </summary>
+    // TEST/DEBUG ENDPOINT — Returns the contents of a specific file from the SFTP server.
     [Function("SftpOrchestration_GetFile")]
     public async Task<HttpResponseData> GetFile(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files/{fileName}")] HttpRequestData req,
@@ -315,26 +314,36 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
             return badRequest;
         }
 
-        string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
-
-        using var client = await sftpClientFactory.CreateConnectedClientAsync();
-
-        if (!client.Exists(remoteFilePath))
+        try
         {
-            var notFound = req.CreateResponse(System.Net.HttpStatusCode.NotFound);
-            await notFound.WriteStringAsync($"File not found: {fileName}");
-            return notFound;
+            string remoteFilePath = $"{sftpClientFactory.RemotePath}/{fileName}";
+
+            using var client = await sftpClientFactory.CreateConnectedClientAsync();
+
+            if (!client.Exists(remoteFilePath))
+            {
+                var notFound = req.CreateResponse(System.Net.HttpStatusCode.NotFound);
+                await notFound.WriteStringAsync($"File not found: {fileName}");
+                return notFound;
+            }
+
+            using var memoryStream = new MemoryStream();
+            client.DownloadFile(remoteFilePath, memoryStream);
+
+            string content = System.Text.Encoding.UTF8.GetString(memoryStream.ToArray());
+            logger.LogInformation("[SFTP] Read file {fileName} ({length} bytes) from SFTP server.", fileName, content.Length);
+
+            var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+            response.Headers.Add("Content-Type", "text/plain");
+            await response.WriteStringAsync(content);
+            return response;
         }
-
-        using var memoryStream = new MemoryStream();
-        client.DownloadFile(remoteFilePath, memoryStream);
-
-        string content = System.Text.Encoding.UTF8.GetString(memoryStream.ToArray());
-        logger.LogInformation("[SFTP] Read file {fileName} ({length} bytes) from SFTP server.", fileName, content.Length);
-
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "text/plain");
-        await response.WriteStringAsync(content);
-        return response;
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[SFTP] Failed to read file {fileName} from SFTP server.", fileName);
+            var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Failed to read file from SFTP server.");
+            return error;
+        }
     }
 }

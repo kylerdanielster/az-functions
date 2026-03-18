@@ -42,15 +42,15 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
     }
 
-    // TODO: Callback failure resilience
-    // Problem: If SftpOrchestration.SendCallback fails after retries, the Coordinator never
-    // receives the callback and the batch stays stuck in "Processing" forever.
+    // TODO: Callback failure resilience (Processed/Error callbacks)
+    // Problem: If SftpOrchestration.SendCallback fails after retries for the Processed or Error
+    // callback, the batch stays stuck in "Processing" forever.
+    // Note: The Processing transition is handled locally (no callback dependency), so only
+    // terminal-state callbacks can cause stuck batches.
     // Potential solutions:
     //   1. Reconciliation timer that periodically queries Durable Functions orchestration status
     //      for stuck batches and replays missed callbacks.
     //   2. Simple timeout that marks batches stuck in "Processing" beyond a threshold as "Error".
-    // Status: Research required — needs investigation into Durable Functions client API for
-    // querying orchestration output by instance ID pattern (sftp-{batchId}).
 
     /// <summary>
     /// Callback webhook that receives batch status updates from the SFTP Processor.
@@ -137,6 +137,8 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
                 $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
             response.EnsureSuccessStatusCode();
 
+            await batchTracker.UpdateBatchStatusAsync(batchId, BatchStatus.Processing);
+
             logger.LogInformation("[SFTP] Batch {batchId} submitted — {count} payments.",
                 batchId, queuedPayments.Count);
         }
@@ -149,9 +151,9 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         return batchId;
     }
 
-    // --- Testing / Verification Endpoints ---
+    // --- TEST/DEBUG ENDPOINTS ---
 
-    // Testing: HTTP trigger that returns batchId (used by E2E test script)
+    // TEST/DEBUG ENDPOINT — HTTP trigger that returns batchId (used by E2E test script)
     [Function(nameof(TriggerDataFeed))]
     public async Task<HttpResponseData> TriggerDataFeed(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "datafeed/trigger")] HttpRequestData req,
@@ -166,43 +168,55 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         return response;
     }
 
-    // Testing: returns batch + payment statuses from Table Storage (used by E2E test script)
+    // TEST/DEBUG ENDPOINT — returns batch + payment statuses from Table Storage (used by E2E test script)
     [Function(nameof(GetBatchStatus))]
     public async Task<HttpResponseData> GetBatchStatus(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "batch/{batchId}")] HttpRequestData req,
         string batchId,
         FunctionContext executionContext)
     {
-        var batch = await batchTracker.GetBatchAsync(batchId);
-        if (batch is null)
+        ILogger logger = executionContext.GetLogger(nameof(GetBatchStatus));
+
+        try
         {
-            var notFound = req.CreateResponse(HttpStatusCode.NotFound);
-            await notFound.WriteStringAsync($"Batch not found: {batchId}");
-            return notFound;
+            var batch = await batchTracker.GetBatchAsync(batchId);
+            if (batch is null)
+            {
+                var notFound = req.CreateResponse(HttpStatusCode.NotFound);
+                await notFound.WriteStringAsync($"Batch not found: {batchId}");
+                return notFound;
+            }
+
+            var paymentEntities = await batchTracker.GetBatchPaymentsAsync(batchId);
+
+            var result = new BatchStatusResponse(
+                BatchId: batchId,
+                Status: batch.GetString("Status") ?? "Unknown",
+                PaymentCount: batch.GetInt32("PaymentCount") ?? 0,
+                CreatedAt: batch.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue,
+                CompletedAt: batch.GetDateTimeOffset("CompletedAt"),
+                Payments: paymentEntities
+                    .Select(p => new PaymentStatus(
+                        PaymentId: p.RowKey,
+                        Status: p.GetString("Status") ?? "Unknown",
+                        CreatedAt: p.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue))
+                    .OrderBy(p => p.PaymentId)
+                    .ToList());
+
+            var response = req.CreateResponse(HttpStatusCode.OK);
+            await response.WriteAsJsonAsync(result);
+            return response;
         }
-
-        var paymentEntities = await batchTracker.GetBatchPaymentsAsync(batchId);
-
-        var result = new BatchStatusResponse(
-            BatchId: batchId,
-            Status: batch.GetString("Status") ?? "Unknown",
-            PaymentCount: batch.GetInt32("PaymentCount") ?? 0,
-            CreatedAt: batch.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue,
-            CompletedAt: batch.GetDateTimeOffset("CompletedAt"),
-            Payments: paymentEntities
-                .Select(p => new PaymentStatus(
-                    PaymentId: p.RowKey,
-                    Status: p.GetString("Status") ?? "Unknown",
-                    CreatedAt: p.GetDateTimeOffset("CreatedAt") ?? DateTimeOffset.MinValue))
-                .OrderBy(p => p.PaymentId)
-                .ToList());
-
-        var response = req.CreateResponse(HttpStatusCode.OK);
-        await response.WriteAsJsonAsync(result);
-        return response;
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[SFTP] Failed to get batch status for {batchId}.", batchId);
+            var error = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Failed to retrieve batch status.");
+            return error;
+        }
     }
 
-    // Testing: clears all BatchTracking table data (used by E2E test script)
+    // TEST/DEBUG ENDPOINT — clears all BatchTracking table data (used by E2E test script)
     [Function(nameof(ClearBatchData))]
     public async Task<HttpResponseData> ClearBatchData(
         [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "batch")] HttpRequestData req,
@@ -210,11 +224,21 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
     {
         ILogger logger = executionContext.GetLogger(nameof(ClearBatchData));
 
-        int count = await batchTracker.ClearAllAsync();
-        logger.LogInformation("[SFTP] Cleared {count} entities from BatchTracking table.", count);
+        try
+        {
+            int count = await batchTracker.ClearAllAsync();
+            logger.LogInformation("[SFTP] Cleared {count} entities from BatchTracking table.", count);
 
-        var response = req.CreateResponse(HttpStatusCode.OK);
-        await response.WriteAsJsonAsync(new { deleted = count });
-        return response;
+            var response = req.CreateResponse(HttpStatusCode.OK);
+            await response.WriteAsJsonAsync(new { deleted = count });
+            return response;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[SFTP] Failed to clear batch data.");
+            var error = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Failed to clear batch data.");
+            return error;
+        }
     }
 }
