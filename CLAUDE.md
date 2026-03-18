@@ -11,17 +11,17 @@ C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP. Names
 Two-app architecture for batch payment processing using HTTP + Storage Queue + callback:
 
 **App 1: Coordinator** (`SftpDataFeed.cs`)
-1. `RunDataFeed` (Timer) / `TriggerDataFeed` (HTTP) — generates 10 fake payments via Bogus, creates batch in Table Storage, POSTs each item to App 2
-2. `BatchItemCompleted` (HTTP callback) — receives completion callbacks, updates Table Storage, detects batch completion
-3. `GetBatchStatus` (HTTP GET) — returns batch + item statuses from Table Storage
+1. `RunDataFeed` (Timer) / `TriggerDataFeed` (HTTP) — generates 10 fake payments via Bogus, creates batch + 2 file entities in Table Storage, POSTs entire batch to App 2 in one request
+2. `BatchCompleted` (HTTP callback) — receives single completion callback with per-file results, updates file entities and batch status via `CompleteBatchFromResultsAsync`
+3. `GetBatchStatus` (HTTP GET) — returns batch + file statuses from Table Storage
 4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)
 
 **App 2: SFTP Processor** (`SftpProcessor.cs` + `SftpOrchestration.cs`)
-1. `ReceiveSftpRequest` (HTTP) — validates required fields, drops onto Storage Queue via `IMessageQueue`, returns 202
-2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}-{itemId}`)
-3. `SftpOrchestration` (Orchestrator) — generates person + address file content in parallel, uploads each to SFTP from memory with retry (per-file try/catch), sends callback with `List<FileResult>`. Callback failure is isolated — files stay uploaded even if callback fails
+1. `ReceiveSftpRequest` (HTTP) — validates `SftpBatchRequest` (BatchId, Items, CallbackUrl), drops onto Storage Queue via `IMessageQueue`, returns 202
+2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}`)
+3. `SftpOrchestration` (Orchestrator) — generates combined person + address CSV files from all batch items in parallel, uploads each to SFTP from memory with retry (per-file try/catch), sends callback with `List<FileResult>`. Output files: `person_{batchId}.csv` and `address_{batchId}.csv`. Callback failure is isolated — files stay uploaded even if callback fails
 
-**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Three entity levels: batch (PK: "batch"), item (PK: batchId, RK: itemId), and file (PK: batchId, RK: `{itemId}_{fileType}`). Item status is derived from its file statuses via `UpdateItemFromFilesAsync`. Batch completion is based on file count. Entity creation is idempotent (409 Conflict ignored). Batch completion is race-safe (status guard + ETag/412 catch).
+**Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Two entity levels: batch (PK: "batch", RK: batchId) and file (PK: batchId, RK: fileType). Each batch has exactly 2 file entities (person, address). Single callback per batch updates all entities via `CompleteBatchFromResultsAsync`. Batch status derived from file results: Completed (both succeed), PartialFailure (one fails), Failed (both fail). Entity creation is idempotent (409 Conflict ignored).
 
 **Storage**: All services (Table Storage, Queue, Durable Functions state) use the single `AzureWebJobsStorage` connection string. Locally → Azurite. In production → dedicated storage account separate from the function app's built-in storage.
 
@@ -100,10 +100,9 @@ dotnet test tests/AzFunctions.Tests/ --collect:"XPlat Code Coverage"  # with cov
 ```
 
 Test files:
-- `ReceiveSftpRequestTests.cs` — input validation (null body, missing fields, valid request)
-- `BatchCompletionTests.cs` — race-safe completion (happy path, already-completed, concurrent race)
-- `BatchItemCompletedTests.cs` — callback handling (file updates, batch completion, race-lost)
-- `GenerateBatchTests.cs` — batch submission (all succeed, mid-batch failure, all fail)
+- `ReceiveSftpRequestTests.cs` — input validation (null body, missing fields, empty items, valid request)
+- `BatchCompletedTests.cs` — callback handling (valid callback, null request, partial failure)
+- `GenerateBatchTests.cs` — batch submission (submit succeeds, submit fails marks files failed)
 - `SftpOrchestrationTests.cs` — orchestrator error isolation (callback failure, single file failure)
 - `Helpers/` — `FakeHttpRequestData`, `FakeHttpResponseData`, `FakeFunctionContext` for Azure Functions isolated worker model
 
@@ -111,7 +110,7 @@ Tests mock `IBatchTracker`, `IMessageQueue`, `ISftpClientFactory`, and `IHttpCli
 
 **E2E tests**: `./test-sftp-orchestration.sh` (requires Docker services + `func start`).
 
-**Coverage**: Unit tests cover business logic callers (validation, error handling, race conditions). Infrastructure classes (`TableBatchTracker`, `SftpClientFactory`, `StorageQueueClient`) are covered by E2E.
+**Coverage**: Unit tests cover business logic callers (validation, error handling, callback processing). Infrastructure classes (`TableBatchTracker`, `SftpClientFactory`, `StorageQueueClient`) are covered by E2E.
 
 ## Auto-Loaded Rules (`.claude/rules/`)
 

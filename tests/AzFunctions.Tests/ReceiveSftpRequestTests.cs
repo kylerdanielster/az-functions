@@ -14,10 +14,11 @@ public class ReceiveSftpRequestTests
     [Fact]
     public async Task ValidRequest_Returns202AndQueuesMessage()
     {
-        var body = new SftpProcessRequest("batch1", "item-000",
-            new PersonData("John", "Doe", "1990-01-01"),
-            new AddressData("123 Main St", "Springfield", "IL", "62701"),
-            "http://localhost/callback");
+        var body = new SftpBatchRequest("batch1", [
+            new BatchItem("item-000",
+                new PersonData("John", "Doe", "1990-01-01"),
+                new AddressData("123 Main St", "Springfield", "IL", "62701"))
+        ], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
         var response = await CreateProcessor().ReceiveSftpRequest(req, context);
@@ -40,10 +41,11 @@ public class ReceiveSftpRequestTests
     [Fact]
     public async Task MissingBatchId_Returns400()
     {
-        var body = new SftpProcessRequest("", "item-000",
-            new PersonData("John", "Doe", "1990-01-01"),
-            new AddressData("123 Main St", "Springfield", "IL", "62701"),
-            "http://localhost/callback");
+        var body = new SftpBatchRequest("", [
+            new BatchItem("item-000",
+                new PersonData("John", "Doe", "1990-01-01"),
+                new AddressData("123 Main St", "Springfield", "IL", "62701"))
+        ], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
         var response = await CreateProcessor().ReceiveSftpRequest(req, context);
@@ -53,11 +55,10 @@ public class ReceiveSftpRequestTests
     }
 
     [Fact]
-    public async Task MissingPerson_Returns400()
+    public async Task EmptyItems_Returns400()
     {
-        // Serialize manually to produce null Person
-        var json = """{"batchId":"batch1","itemId":"item-000","person":null,"address":{"street":"123","city":"X","state":"IL","zipCode":"62701"},"callbackUrl":"http://localhost/callback"}""";
-        var req = new FakeHttpRequestData(context, json);
+        var body = new SftpBatchRequest("batch1", [], "http://localhost/callback");
+        var req = FakeHttpRequestData.CreateWithJson(context, body);
 
         var response = await CreateProcessor().ReceiveSftpRequest(req, context);
 

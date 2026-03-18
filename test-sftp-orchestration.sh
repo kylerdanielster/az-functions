@@ -50,12 +50,6 @@ for i in $(seq 1 60); do
   STATUS_RESPONSE=$(curl -s "$BASE_URL/batch/$BATCH_ID")
 
   BATCH_STATUS=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Status','Unknown'))" 2>/dev/null || echo "Unknown")
-  COMPLETED_COUNT=$(echo "$STATUS_RESPONSE" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-items = d.get('Items', [])
-print(len([i for i in items if i.get('Status') in ('Completed','Failed')]))" 2>/dev/null || echo "0")
-  TOTAL_COUNT=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ItemCount',0))" 2>/dev/null || echo "0")
   FILES_DONE=$(echo "$STATUS_RESPONSE" | python3 -c "
 import sys,json
 d = json.load(sys.stdin)
@@ -63,9 +57,9 @@ files = d.get('Files', [])
 print(len([f for f in files if f.get('Status') in ('Completed','Failed')]))" 2>/dev/null || echo "0")
   FILES_TOTAL=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('Files', [])))" 2>/dev/null || echo "0")
 
-  echo "  Poll $i: $COMPLETED_COUNT/$TOTAL_COUNT items done, $FILES_DONE/$FILES_TOTAL files done (batch: $BATCH_STATUS)"
+  echo "  Poll $i: $FILES_DONE/$FILES_TOTAL files done (batch: $BATCH_STATUS)"
 
-  if [ "$BATCH_STATUS" = "Completed" ] || [ "$BATCH_STATUS" = "PartialFailure" ]; then
+  if [ "$BATCH_STATUS" = "Completed" ] || [ "$BATCH_STATUS" = "PartialFailure" ] || [ "$BATCH_STATUS" = "Failed" ]; then
     FINAL_STATUS="$BATCH_STATUS"
     echo ""
     echo "  Batch $BATCH_STATUS!"
@@ -80,26 +74,6 @@ print(len([f for f in files if f.get('Status') in ('Completed','Failed')]))" 2>/
 done
 echo ""
 
-# Display item status table from Table Storage
-echo "  Item Status (from BatchTracking table):"
-echo "  -------------------------------------------"
-echo "$STATUS_RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-for item in d.get('Items', []):
-    item_id = item.get('ItemId', '')
-    status = item.get('Status', 'Unknown')
-    completed = item.get('CompletedAt', '')
-    error = item.get('ErrorMessage', '')
-    if completed:
-        completed = completed[:19]  # trim to readable length
-    line = f'  {item_id:<12} {status:<12} {completed}'
-    if error:
-        line += f'  ERROR: {error}'
-    print(line)
-"
-echo ""
-
 # Display file status table from Table Storage
 echo "  File Status (from BatchTracking table):"
 echo "  -------------------------------------------"
@@ -107,14 +81,13 @@ echo "$STATUS_RESPONSE" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 for f in d.get('Files', []):
-    item_id = f.get('ItemId', '')
     file_type = f.get('FileType', '')
     status = f.get('Status', 'Unknown')
     completed = f.get('CompletedAt', '')
     error = f.get('ErrorMessage', '')
     if completed:
         completed = completed[:19]
-    line = f'  {item_id:<12} {file_type:<12} {status:<12} {completed}'
+    line = f'  {file_type:<12} {status:<12} {completed}'
     if error:
         line += f'  ERROR: {error}'
     print(line)
@@ -154,14 +127,6 @@ echo "============================================"
 echo "  Summary"
 echo "============================================"
 
-COMPLETED_ITEMS=$(echo "$STATUS_RESPONSE" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-print(len([i for i in d.get('Items', []) if i.get('Status') == 'Completed']))" 2>/dev/null || echo "0")
-FAILED_ITEMS=$(echo "$STATUS_RESPONSE" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-print(len([i for i in d.get('Items', []) if i.get('Status') == 'Failed']))" 2>/dev/null || echo "0")
 COMPLETED_FILE_ENTITIES=$(echo "$STATUS_RESPONSE" | python3 -c "
 import sys,json
 d = json.load(sys.stdin)
@@ -173,12 +138,11 @@ print(len([f for f in d.get('Files', []) if f.get('Status') == 'Failed']))" 2>/d
 
 echo ""
 echo "  Batch:  $FINAL_STATUS"
-echo "  Items:  $COMPLETED_ITEMS completed, $FAILED_ITEMS failed"
 echo "  Files (tracking):  $COMPLETED_FILE_ENTITIES completed, $FAILED_FILE_ENTITIES failed"
 echo "  Files (SFTP):  $FILE_COUNT uploaded ($PERSON_COUNT person + $ADDRESS_COUNT address)"
 echo ""
 
-if [ "$FINAL_STATUS" = "Completed" ] && [ "$FILE_COUNT" -ge 20 ] && [ "$COMPLETED_FILE_ENTITIES" -ge 20 ] && [ "$FAILED_FILE_ENTITIES" -eq 0 ]; then
+if [ "$FINAL_STATUS" = "Completed" ] && [ "$FILE_COUNT" -ge 2 ] && [ "$COMPLETED_FILE_ENTITIES" -ge 2 ] && [ "$FAILED_FILE_ENTITIES" -eq 0 ]; then
   echo "  Result: PASS"
 else
   echo "  Result: FAIL"

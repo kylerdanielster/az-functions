@@ -9,8 +9,8 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// SFTP Processor (App 2) orchestration and activities. Generates person/address file
-/// content in memory and uploads each independently to the SFTP server with retry
+/// SFTP Processor (App 2) orchestration and activities. Generates combined person/address CSV
+/// files from all batch items and uploads each independently to the SFTP server with retry
 /// (per-file error isolation). Sends a completion callback with per-file results to the Coordinator.
 /// Callback failure is isolated from file uploads — see <see cref="RunOrchestrator"/>.
 /// </summary>
@@ -30,9 +30,9 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     };
 
     /// <summary>
-    /// Durable Functions orchestrator. Generates person and address file content in parallel,
-    /// then uploads each from memory to SFTP with retry. Each file has its own try/catch
-    /// so a failure in one doesn't prevent the other. Sends a callback with per-file results.
+    /// Durable Functions orchestrator. Generates combined person and address CSV files in parallel
+    /// from all batch items, then uploads each from memory to SFTP with retry. Each file has its
+    /// own try/catch so a failure in one doesn't prevent the other. Sends a callback with per-file results.
     /// Callback failure is isolated — if the callback fails after retries, the orchestration
     /// still completes (files are already uploaded).
     /// </summary>
@@ -43,25 +43,25 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         ILogger logger = context.CreateReplaySafeLogger(nameof(SftpOrchestration));
         string id = context.InstanceId;
 
-        var request = context.GetInput<SftpProcessRequest>()
+        var request = context.GetInput<SftpBatchRequest>()
             ?? throw new InvalidOperationException("Orchestration input is missing.");
 
-        logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, item {itemId}.",
-            id, request.BatchId, request.ItemId);
+        logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, {itemCount} items.",
+            id, request.BatchId, request.Items.Count);
 
         // Create file content in parallel
-        logger.LogInformation("[SFTP] Orchestration {id} — creating files...", id);
+        logger.LogInformation("[SFTP] Orchestration {id} — creating CSV files...", id);
         var personContentTask = context.CallActivityAsync<string>(nameof(CreatePersonFile),
-            new CreatePersonFileInput(id, request.Person));
+            new CreatePersonFileInput(request.BatchId, request.Items));
         var addressContentTask = context.CallActivityAsync<string>(nameof(CreateAddressFile),
-            new CreateAddressFileInput(id, request.Address));
+            new CreateAddressFileInput(request.BatchId, request.Items));
         await Task.WhenAll(personContentTask, addressContentTask);
 
         string personContent = personContentTask.Result;
         string addressContent = addressContentTask.Result;
 
-        string personFileName = $"person_{id}.txt";
-        string addressFileName = $"address_{id}.txt";
+        string personFileName = $"person_{request.BatchId}.csv";
+        string addressFileName = $"address_{request.BatchId}.csv";
 
         // Upload each file independently — a failure in one doesn't prevent the other
         var fileResults = new List<FileResult>();
@@ -94,7 +94,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
         // Send callback to coordinator with per-file results.
         // Callback failure is isolated — files are already uploaded successfully.
-        var result = new SftpProcessResult(request.BatchId, request.ItemId, fileResults);
+        var result = new SftpBatchResult(request.BatchId, fileResults);
         try
         {
             await context.CallActivityAsync(nameof(SendCallback),
@@ -115,35 +115,45 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
 
     // --- Activity inputs ---
 
-    public record CreatePersonFileInput(string InstanceId, PersonData Person);
-    public record CreateAddressFileInput(string InstanceId, AddressData Address);
+    public record CreatePersonFileInput(string BatchId, List<BatchItem> Items);
+    public record CreateAddressFileInput(string BatchId, List<BatchItem> Items);
     public record UploadFileInput(string FileName, string Content);
-    public record SendCallbackInput(string CallbackUrl, SftpProcessResult Result);
+    public record SendCallbackInput(string CallbackUrl, SftpBatchResult Result);
 
     // --- Activities ---
 
-    /// <summary>Activity that builds person data content and returns it as a string.</summary>
+    /// <summary>Activity that builds a combined person CSV from all batch items.</summary>
     [Function(nameof(CreatePersonFile))]
     public static string CreatePersonFile([ActivityTrigger] CreatePersonFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(CreatePersonFile));
-        var person = input.Person;
 
-        string content = $"First Name: {person.FirstName}\nLast Name: {person.LastName}\nDate of Birth: {person.DateOfBirth}";
-        logger.LogInformation("[SFTP] Created person file content for {instanceId}.", input.InstanceId);
-        return content;
+        var sb = new StringBuilder();
+        sb.AppendLine("ItemId,FirstName,LastName,DateOfBirth");
+        foreach (var item in input.Items)
+        {
+            sb.AppendLine($"{CsvEscape(item.ItemId)},{CsvEscape(item.Person.FirstName)},{CsvEscape(item.Person.LastName)},{CsvEscape(item.Person.DateOfBirth)}");
+        }
+
+        logger.LogInformation("[SFTP] Created person CSV for batch {batchId} ({count} items).", input.BatchId, input.Items.Count);
+        return sb.ToString();
     }
 
-    /// <summary>Activity that builds address data content and returns it as a string.</summary>
+    /// <summary>Activity that builds a combined address CSV from all batch items.</summary>
     [Function(nameof(CreateAddressFile))]
     public static string CreateAddressFile([ActivityTrigger] CreateAddressFileInput input, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(CreateAddressFile));
-        var address = input.Address;
 
-        string content = $"Street: {address.Street}\nCity: {address.City}\nState: {address.State}\nZip Code: {address.ZipCode}";
-        logger.LogInformation("[SFTP] Created address file content for {instanceId}.", input.InstanceId);
-        return content;
+        var sb = new StringBuilder();
+        sb.AppendLine("ItemId,Street,City,State,ZipCode");
+        foreach (var item in input.Items)
+        {
+            sb.AppendLine($"{CsvEscape(item.ItemId)},{CsvEscape(item.Address.Street)},{CsvEscape(item.Address.City)},{CsvEscape(item.Address.State)},{CsvEscape(item.Address.ZipCode)}");
+        }
+
+        logger.LogInformation("[SFTP] Created address CSV for batch {batchId} ({count} items).", input.BatchId, input.Items.Count);
+        return sb.ToString();
     }
 
     /// <summary>Activity that connects to SFTP asynchronously and uploads file content from memory.</summary>
@@ -175,8 +185,15 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         response.EnsureSuccessStatusCode();
 
         int successCount = input.Result.Files.Count(f => f.Succeeded);
-        logger.LogInformation("[SFTP] Callback sent for batch {batchId}, item {itemId} ({successCount}/{totalCount} files succeeded).",
-            input.Result.BatchId, input.Result.ItemId, successCount, input.Result.Files.Count);
+        logger.LogInformation("[SFTP] Callback sent for batch {batchId} ({successCount}/{totalCount} files succeeded).",
+            input.Result.BatchId, successCount, input.Result.Files.Count);
+    }
+
+    private static string CsvEscape(string field)
+    {
+        if (field.Contains(',') || field.Contains('"') || field.Contains('\n'))
+            return $"\"{field.Replace("\"", "\"\"")}\"";
+        return field;
     }
 
     // --- SFTP Server Inspection Endpoints ---

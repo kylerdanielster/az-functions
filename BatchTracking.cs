@@ -4,48 +4,33 @@ using Azure.Data.Tables;
 namespace AzFunctions;
 
 /// <summary>
-/// Tracks batch, item, and file status in Azure Table Storage.
+/// Tracks batch and file status in Azure Table Storage.
 /// Used by the Coordinator (App 1) to manage batch lifecycle.
-/// Item status is derived from per-file statuses.
 /// </summary>
 public interface IBatchTracker
 {
     /// <summary>Creates a batch entity. Idempotent — ignores 409 Conflict if entity already exists.</summary>
     Task CreateBatchAsync(string batchId, int itemCount);
 
-    /// <summary>Creates an item entity. Idempotent — ignores 409 Conflict if entity already exists.</summary>
-    Task CreateItemAsync(string batchId, string itemId);
-
     /// <summary>Creates a file entity. Idempotent — ignores 409 Conflict if entity already exists.</summary>
-    Task CreateFileAsync(string batchId, string itemId, string fileType);
-
-    /// <summary>Updates a file entity's status. Idempotent — skips if already terminal or not found.</summary>
-    Task UpdateFileStatusAsync(string batchId, string itemId, string fileType, string status, string? errorMessage = null);
-
-    /// <summary>Derives item status from its file statuses. No-op if files are still in progress.</summary>
-    Task UpdateItemFromFilesAsync(string batchId, string itemId);
-
-    /// <summary>Returns true if all files in the batch have reached a terminal status.</summary>
-    Task<bool> IsBatchCompleteAsync(string batchId);
+    Task CreateFileAsync(string batchId, string fileType);
 
     /// <summary>
-    /// Marks a batch as Completed or PartialFailure. Race-safe: returns false if
-    /// the batch is already terminal or another thread won the ETag race (412 Conflict).
+    /// Updates file entities from the callback results and sets the batch status.
+    /// Single callback per batch — no race handling needed.
     /// </summary>
-    Task<bool> CompleteBatchAsync(string batchId);
+    Task CompleteBatchFromResultsAsync(string batchId, List<FileResult> files);
 
     // Testing: query and cleanup methods used by test endpoints
     Task<TableEntity?> GetBatchAsync(string batchId);
-    Task<List<TableEntity>> GetBatchItemsAsync(string batchId);
     Task<List<TableEntity>> GetBatchFilesAsync(string batchId);
     Task<int> ClearAllAsync();
 }
 
 /// <summary>
 /// Azure Table Storage implementation of <see cref="IBatchTracker"/>.
-/// Uses a single "BatchTracking" table with three entity levels:
-/// batch (PK: "batch"), item (PK: batchId, RK: itemId),
-/// and file (PK: batchId, RK: "{itemId}_{fileType}").
+/// Uses a single "BatchTracking" table with two entity levels:
+/// batch (PK: "batch", RK: batchId) and file (PK: batchId, RK: fileType).
 /// Part of the Coordinator (App 1).
 /// </summary>
 public class TableBatchTracker(TableClient tableClient) : IBatchTracker
@@ -56,7 +41,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         {
             ["Status"] = BatchStatus.Processing,
             ["ItemCount"] = itemCount,
-            ["FileCount"] = itemCount * 2,
+            ["FileCount"] = 2,
             ["CreatedAt"] = DateTimeOffset.UtcNow
         };
         try
@@ -69,28 +54,10 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         }
     }
 
-    public async Task CreateItemAsync(string batchId, string itemId)
+    public async Task CreateFileAsync(string batchId, string fileType)
     {
-        var entity = new TableEntity(batchId, itemId)
+        var entity = new TableEntity(batchId, fileType)
         {
-            ["Status"] = BatchStatus.Queued,
-            ["CreatedAt"] = DateTimeOffset.UtcNow
-        };
-        try
-        {
-            await tableClient.AddEntityAsync(entity);
-        }
-        catch (RequestFailedException ex) when (ex.Status == 409)
-        {
-            // Entity already exists — idempotent, no action needed
-        }
-    }
-
-    public async Task CreateFileAsync(string batchId, string itemId, string fileType)
-    {
-        var entity = new TableEntity(batchId, $"{itemId}_{fileType}")
-        {
-            ["ItemId"] = itemId,
             ["FileType"] = fileType,
             ["Status"] = BatchStatus.Queued,
             ["CreatedAt"] = DateTimeOffset.UtcNow
@@ -105,137 +72,40 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         }
     }
 
-    public async Task UpdateFileStatusAsync(string batchId, string itemId, string fileType, string status, string? errorMessage = null)
+    public async Task CompleteBatchFromResultsAsync(string batchId, List<FileResult> files)
     {
-        string rowKey = $"{itemId}_{fileType}";
-        TableEntity entity;
-        try
+        foreach (var file in files)
         {
-            var response = await tableClient.GetEntityAsync<TableEntity>(batchId, rowKey);
-            entity = response.Value;
-        }
-        catch (RequestFailedException ex) when (ex.Status == 404)
-        {
-            return; // File entity not found — idempotent
-        }
-
-        if (entity.GetString("Status") is BatchStatus.Completed or BatchStatus.Failed)
-            return; // Already terminal — idempotent
-
-        entity["Status"] = status;
-        entity["CompletedAt"] = DateTimeOffset.UtcNow;
-        if (errorMessage is not null)
-            entity["ErrorMessage"] = errorMessage;
-
-        await tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
-    }
-
-    public async Task UpdateItemFromFilesAsync(string batchId, string itemId)
-    {
-        // Query file entities for this item (RowKey starts with "{itemId}_")
-        var files = new List<TableEntity>();
-        await foreach (var file in tableClient.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{batchId}' and ItemId eq '{itemId}'"))
-        {
-            if (file.RowKey?.Contains('_') == true)
-                files.Add(file);
-        }
-
-        bool allCompleted = files.Count > 0 && files.All(f => f.GetString("Status") == BatchStatus.Completed);
-        bool anyFailed = files.Any(f => f.GetString("Status") == BatchStatus.Failed);
-        bool anyQueued = files.Any(f => f.GetString("Status") == BatchStatus.Queued);
-
-        string status;
-        if (allCompleted)
-            status = BatchStatus.Completed;
-        else if (anyFailed && !anyQueued)
-            status = BatchStatus.Failed;
-        else
-            return; // Still processing — no update
-
-        // Update the item entity
-        TableEntity itemEntity;
-        try
-        {
-            var response = await tableClient.GetEntityAsync<TableEntity>(batchId, itemId);
-            itemEntity = response.Value;
-        }
-        catch (RequestFailedException ex) when (ex.Status == 404)
-        {
-            return;
-        }
-
-        string? errorMessage = anyFailed
-            ? string.Join("; ", files
-                .Where(f => f.GetString("Status") == BatchStatus.Failed && f.GetString("ErrorMessage") is not null)
-                .Select(f => $"{f.GetString("FileType")}: {f.GetString("ErrorMessage")}"))
-            : null;
-
-        itemEntity["Status"] = status;
-        itemEntity["CompletedAt"] = DateTimeOffset.UtcNow;
-        if (errorMessage is not null)
-            itemEntity["ErrorMessage"] = errorMessage;
-
-        await tableClient.UpdateEntityAsync(itemEntity, itemEntity.ETag, TableUpdateMode.Replace);
-    }
-
-    public async Task<bool> IsBatchCompleteAsync(string batchId)
-    {
-        var batchEntity = await tableClient.GetEntityAsync<TableEntity>("batch", batchId);
-        int fileCount = batchEntity.Value.GetInt32("FileCount")
-            ?? throw new InvalidOperationException($"Batch {batchId} missing FileCount.");
-
-        int completedFileCount = 0;
-        await foreach (var entity in tableClient.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{batchId}'"))
-        {
-            // File entities have RowKeys containing "_" (e.g., "item-000_person")
-            if (entity.RowKey?.Contains('_') != true)
-                continue;
-
-            string status = entity.GetString("Status") ?? "";
-            if (status is BatchStatus.Completed or BatchStatus.Failed)
-                completedFileCount++;
-        }
-
-        return completedFileCount >= fileCount;
-    }
-
-    public async Task<bool> CompleteBatchAsync(string batchId)
-    {
-        var response = await tableClient.GetEntityAsync<TableEntity>("batch", batchId);
-        var entity = response.Value;
-
-        // Already terminal — another thread completed the batch first
-        string currentStatus = entity.GetString("Status") ?? "";
-        if (currentStatus is BatchStatus.Completed or BatchStatus.PartialFailure)
-            return false;
-
-        // Check if any files failed
-        bool hasFailures = false;
-        await foreach (var file in tableClient.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{batchId}'"))
-        {
-            if (file.RowKey?.Contains('_') == true && file.GetString("Status") == BatchStatus.Failed)
+            try
             {
-                hasFailures = true;
-                break;
+                var response = await tableClient.GetEntityAsync<TableEntity>(batchId, file.FileType);
+                var entity = response.Value;
+
+                entity["Status"] = file.Succeeded ? BatchStatus.Completed : BatchStatus.Failed;
+                entity["CompletedAt"] = DateTimeOffset.UtcNow;
+                if (file.ErrorMessage is not null)
+                    entity["ErrorMessage"] = file.ErrorMessage;
+
+                await tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404)
+            {
+                // File entity not found — skip
             }
         }
 
-        entity["Status"] = hasFailures ? BatchStatus.PartialFailure : BatchStatus.Completed;
-        entity["CompletedAt"] = DateTimeOffset.UtcNow;
+        // Determine batch status from file results
+        bool allSucceeded = files.All(f => f.Succeeded);
+        bool allFailed = files.All(f => !f.Succeeded);
+        string batchStatus = allSucceeded ? BatchStatus.Completed
+            : allFailed ? BatchStatus.Failed
+            : BatchStatus.PartialFailure;
 
-        try
-        {
-            await tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
-            return true;
-        }
-        catch (RequestFailedException ex) when (ex.Status == 412)
-        {
-            // ETag conflict — another thread won the race
-            return false;
-        }
+        var batchResponse = await tableClient.GetEntityAsync<TableEntity>("batch", batchId);
+        var batchEntity = batchResponse.Value;
+        batchEntity["Status"] = batchStatus;
+        batchEntity["CompletedAt"] = DateTimeOffset.UtcNow;
+        await tableClient.UpdateEntityAsync(batchEntity, batchEntity.ETag, TableUpdateMode.Replace);
     }
 
     // Testing: query and cleanup methods used by test endpoints
@@ -253,28 +123,13 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         }
     }
 
-    public async Task<List<TableEntity>> GetBatchItemsAsync(string batchId)
-    {
-        var items = new List<TableEntity>();
-        await foreach (var entity in tableClient.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{batchId}'"))
-        {
-            // Item entities have RowKeys without "_" (e.g., "item-000")
-            if (!entity.RowKey?.Contains('_') ?? true)
-                items.Add(entity);
-        }
-        return items;
-    }
-
     public async Task<List<TableEntity>> GetBatchFilesAsync(string batchId)
     {
         var files = new List<TableEntity>();
         await foreach (var entity in tableClient.QueryAsync<TableEntity>(
             filter: $"PartitionKey eq '{batchId}'"))
         {
-            // File entities have RowKeys with "_" (e.g., "item-000_person")
-            if (entity.RowKey?.Contains('_') == true)
-                files.Add(entity);
+            files.Add(entity);
         }
         return files;
     }

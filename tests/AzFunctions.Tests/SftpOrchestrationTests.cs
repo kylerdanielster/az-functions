@@ -7,23 +7,30 @@ namespace AzFunctions.Tests;
 
 public class SftpOrchestrationTests
 {
+    private static List<BatchItem> CreateTestItems() =>
+    [
+        new BatchItem("item-000",
+            new PersonData("John", "Doe", "1990-01-01"),
+            new AddressData("123 Main St", "Springfield", "IL", "62701")),
+        new BatchItem("item-001",
+            new PersonData("Jane", "Smith", "1985-06-15"),
+            new AddressData("456 Oak Ave", "Chicago", "IL", "60601"))
+    ];
+
     [Fact]
     public async Task CallbackFailure_DoesNotFailOrchestration()
     {
         var context = Substitute.For<TaskOrchestrationContext>();
-        context.InstanceId.Returns("sftp-batch1-item-000");
+        context.InstanceId.Returns("sftp-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
-        context.GetInput<SftpProcessRequest>().Returns(new SftpProcessRequest(
-            "batch1", "item-000",
-            new PersonData("John", "Doe", "1990-01-01"),
-            new AddressData("123 Main St", "Springfield", "IL", "62701"),
-            "http://localhost/callback"));
+        context.GetInput<SftpBatchRequest>().Returns(new SftpBatchRequest(
+            "batch1", CreateTestItems(), "http://localhost/callback"));
 
         // File content creation succeeds
         context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePersonFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
-            .Returns("First Name: John\nLast Name: Doe\nDate of Birth: 1990-01-01");
+            .Returns("ItemId,FirstName,LastName,DateOfBirth\nitem-000,John,Doe,1990-01-01\n");
         context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateAddressFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
-            .Returns("Street: 123 Main St\nCity: Springfield\nState: IL\nZip Code: 62701");
+            .Returns("ItemId,Street,City,State,ZipCode\nitem-000,123 Main St,Springfield,IL,62701\n");
 
         // Uploads succeed
         context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
@@ -43,17 +50,14 @@ public class SftpOrchestrationTests
     public async Task SingleFileUploadFailure_DoesNotBlockOtherFile()
     {
         var context = Substitute.For<TaskOrchestrationContext>();
-        context.InstanceId.Returns("sftp-batch1-item-000");
+        context.InstanceId.Returns("sftp-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
-        context.GetInput<SftpProcessRequest>().Returns(new SftpProcessRequest(
-            "batch1", "item-000",
-            new PersonData("John", "Doe", "1990-01-01"),
-            new AddressData("123 Main St", "Springfield", "IL", "62701"),
-            "http://localhost/callback"));
+        context.GetInput<SftpBatchRequest>().Returns(new SftpBatchRequest(
+            "batch1", CreateTestItems(), "http://localhost/callback"));
 
         // File content creation succeeds
-        string personContent = "First Name: John\nLast Name: Doe\nDate of Birth: 1990-01-01";
-        string addressContent = "Street: 123 Main St\nCity: Springfield\nState: IL\nZip Code: 62701";
+        string personContent = "ItemId,FirstName,LastName,DateOfBirth\nitem-000,John,Doe,1990-01-01\n";
+        string addressContent = "ItemId,Street,City,State,ZipCode\nitem-000,123 Main St,Springfield,IL,62701\n";
 
         context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePersonFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns(personContent);
@@ -61,9 +65,8 @@ public class SftpOrchestrationTests
             .Returns(addressContent);
 
         // Person upload fails, address upload succeeds.
-        // NSubstitute matches on the UploadFileInput passed to the activity.
-        var personInput = new SftpOrchestration.UploadFileInput("person_sftp-batch1-item-000.txt", personContent);
-        var addressInput = new SftpOrchestration.UploadFileInput("address_sftp-batch1-item-000.txt", addressContent);
+        var personInput = new SftpOrchestration.UploadFileInput("person_batch1.csv", personContent);
+        var addressInput = new SftpOrchestration.UploadFileInput("address_batch1.csv", addressContent);
 
         context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), personInput, Arg.Any<TaskOptions>())
             .ThrowsAsync(new TaskFailedException("UploadFile", 1, new ApplicationException("SFTP connection failed")));
