@@ -1,6 +1,6 @@
 # az-functions
 
-Azure Functions v4 project (.NET 10, isolated worker model) demonstrating a two-app batch payment processing architecture with Durable Functions, Storage Queues, and SFTP upload.
+Azure Functions v4 project (.NET 10, isolated worker model) demonstrating a two-app batch payment processing architecture with Durable Functions, Storage Queues, Table Storage, and SFTP upload.
 
 ## Prerequisites
 
@@ -63,49 +63,52 @@ The app runs on port 7071.
 
 In production, this will be two separate function apps. They are combined into a single app for this POC.
 
-- **App 1 — Coordinator** (`BatchCoordinator.cs`, `BatchTracking.cs`): Generates ACH payment batches, submits them to the processor, tracks batch progress via callbacks.
-- **App 2 — SFTP Processor** (`BatchProcessor.cs`, `BatchOrchestration.cs`, `SftpEndpoints.cs`): Receives a batch of payments, creates CSV files (payment + GL), uploads to SFTP, and calls back to App 1 with the result.
+- **App 1 — GM (Coordinator)** (`GM/BatchCoordinator.cs`, `GM/BatchTracking.cs`): Generates ACH payment batches, submits them to the processor, tracks batch progress via callbacks.
+- **App 2 — Fin (Batch Processor)** (`Fin/BatchProcessor.cs`, `Fin/BatchOrchestration.cs`, `Fin/BatchPaymentStore.cs`): Receives a batch of payments, stores payment data in Table Storage, enqueues a lightweight reference to trigger processing, creates CSV files (payment + GL) by reading from the table, uploads to SFTP, and calls back to App 1 with the result.
 
 Communication between the two apps is HTTP + callback. App 1 POSTs the entire batch to App 2 in a single request and receives a status callback when processing completes or fails.
 
 ```
-Step 1: App 1 submits a batch to App 2 (BatchCoordinator.cs)
-─────────────────────────────────────────────────────────
+Step 1: App 1 submits a batch to App 2 (GM/BatchCoordinator.cs)
+─────────────────────────────────────────────────────────────────
 
   RunDataFeed (Timer, daily) / TriggerDataFeed (HTTP POST /api/datafeed/trigger)
     1. Generate 10 fake ACH payments (Bogus)
-    2. Create batch + 10 payment entities in Table Storage via IBatchTracker (BatchTracking.cs)
+    2. Create batch + 10 payment entities in BatchTracking table via IBatchTracker (GM/BatchTracking.cs)
     3. Query all Queued payments for the batch from Table Storage (picks up orphaned payments from a prior failed run)
-    4. POST entire batch to ReceiveBatchRequest (BatchProcessor.cs)
+    4. POST entire batch to ReceiveBatchRequest (Fin/BatchProcessor.cs)
     5. On success, set batch status to Processing
 
-Step 2: App 2 processes the batch (BatchProcessor.cs → BatchOrchestration.cs)
-────────────────────────────────────────────────────────────────────────────
+Step 2: App 2 stores, queues, and processes the batch
+─────────────────────────────────────────────────────────
 
-  ReceiveBatchRequest (HTTP POST /api/batch/process) — BatchProcessor.cs
+  ReceiveBatchRequest (HTTP POST /api/batch/process) — Fin/BatchProcessor.cs
     1. Validate BatchRequest (BatchId, CallbackUrl, Payments)
-    2. Drop message onto batch-processing-queue via IMessageQueue (MessageQueue.cs)
-    3. Return 202 Accepted
+    2. Store payment data + callback URL in BatchPayments table via IBatchPaymentStore (Fin/BatchPaymentStore.cs)
+    3. Enqueue lightweight BatchQueueMessage (BatchId only) onto batch-processing-queue via IMessageQueue
+    4. Return 202 Accepted
 
-  ProcessBatchQueue (Queue Trigger: batch-processing-queue) — BatchProcessor.cs
-    1. Deserialize queue message into BatchRequest
-    2. Start BatchOrchestration via DurableTaskClient (deterministic ID: batch-{batchId})
+  ProcessBatchQueue (Queue Trigger: batch-processing-queue) — Fin/BatchProcessor.cs
+    1. Deserialize BatchQueueMessage to get BatchId
+    2. Read callback URL from BatchPayments table via IBatchPaymentStore.GetCallbackUrlAsync
+    3. Start BatchOrchestration with BatchOrchestrationInput (BatchId, CallbackUrl)
+       Deterministic instance ID: batch-{batchId}
 
-  BatchOrchestration (Durable Functions Orchestrator) — BatchOrchestration.cs
-    1. CreatePaymentFile activity — build payment CSV (all fields)
-    2. UploadFile activity — upload payment CSV to SFTP (with retry)
-       - If UploadFile fails → SendCallback activity (Error), stop (no GL attempt)
-    3. CreateGLFile activity — build GL CSV (excludes sensitive banking fields)
-    4. UploadFile activity — upload GL CSV to SFTP (with retry)
-       - If UploadFile fails → SendToGLErrorQueue activity, no callback
+  BatchOrchestration (Durable Functions Orchestrator) — Fin/BatchOrchestration.cs
+    1. CreatePaymentFile activity — reads payments from BatchPayments table, builds payment CSV (all fields)
+    2. UploadFile activity — uploads payment CSV to SFTP (with retry: 3 attempts, 5s backoff)
+       - If fails → SendCallback activity (Error), stop (no GL attempt)
+    3. CreateGLFile activity — reads payments from BatchPayments table, builds GL CSV (excludes sensitive fields)
+    4. UploadFile activity — uploads GL CSV to SFTP (with retry)
+       - If fails → SendToGLErrorQueue activity, no callback
     5. If both succeed → SendCallback activity (Processed)
 
-Step 3: App 1 receives callbacks (BatchCoordinator.cs)
-──────────────────────────────────────────────────────
+Step 3: App 1 receives callbacks (GM/BatchCoordinator.cs)
+──────────────────────────────────────────────────────────
 
-  BatchCompleted (HTTP POST /api/batch/callback) — BatchCoordinator.cs
+  BatchCompleted (HTTP POST /api/batch/callback)
     1. Receive BatchCallback (BatchId, Status)
-    2. Update batch status in Table Storage via IBatchTracker (BatchTracking.cs)
+    2. Update batch status in BatchTracking table via IBatchTracker
     3. Processed → log (TODO: notify third party)
     4. Error → log warning (TODO: send alert email)
 ```
@@ -119,298 +122,40 @@ Queued → Processing → (stuck)     (GL SFTP failure — no callback, stays Pr
 Queued → Error                    (batch submission failure)
 ```
 
-### Key design decisions
+### Error handling
 
-- **Batch-level processing**: `RunDataFeed` (`BatchCoordinator.cs`) sends all 10 payments in a single request. `BatchOrchestration` (`BatchOrchestration.cs`) creates one payment CSV and one GL CSV for the entire batch.
-- **Sequential file processing**: `UploadFile` uploads the payment file first. The `CreateGLFile` activity is only called if the payment `UploadFile` succeeds.
-- **Deterministic instance IDs**: `ProcessBatchQueue` (`BatchProcessor.cs`) sets the instance ID to `batch-{batchId}`, preventing duplicate orchestrations from at-least-once queue delivery.
-- **GL failure isolation**: When GL `UploadFile` fails, `SendToGLErrorQueue` (`BatchOrchestration.cs`) queues to `gl-error-queue` without sending a callback — App 1 stays in `Processing` until manual retry succeeds.
-- **Storage Queue decoupling**: `ReceiveBatchRequest` (`BatchProcessor.cs`) returns 202 immediately and drops the message onto `batch-processing-queue` via `IMessageQueue` (`MessageQueue.cs`). Built-in retry with poison queue support.
-- **Callback-driven status**: `SendCallback` (`BatchOrchestration.cs`) only calls back for terminal states (Processed, Error). The Processing transition is set locally by `RunDataFeed` (`BatchCoordinator.cs`) after successful submission.
-- **Idempotent status updates**: `UpdateBatchStatusAsync` in `TableBatchTracker` (`BatchTracking.cs`) skips updates if the batch is already in a terminal state. Entity creation ignores 409 Conflict.
+- **Payment `UploadFile` failure**: Activity retry policy (3 attempts, 5s backoff). If all retries fail, `SendCallback` sends Error to App 1 and the orchestrator returns early — `CreateGLFile` is never called.
+- **GL `UploadFile` failure**: Same retry policy. If all retries fail, `SendToGLErrorQueue` queues a `GLErrorMessage` to `gl-error-queue`. No callback is sent — batch stays in Processing until manual retry.
+- **`SendCallback` failure**: Has its own retry policy (3 attempts, 5s backoff). If the callback fails after retries, the batch gets stuck in Processing (see open TODOs in CLAUDE.md).
+- **Queue delivery failure**: `ProcessBatchQueue` retries up to 5x (`maxDequeueCount` in `host.json`), then Azure moves the message to `batch-processing-queue-poison`.
+- **Duplicate orchestration**: `ProcessBatchQueue` sets the instance ID to `batch-{batchId}`, making duplicate starts a no-op.
+- **Idempotent batch status**: `UpdateBatchStatusAsync` in `TableBatchTracker` skips updates if the batch is already in a terminal state.
 
-### Data model (Table Storage)
+## Data Model (Table Storage)
 
-**Table: BatchTracking**
+### BatchTracking table (App 1 — `GM/BatchTracking.cs`)
 
-Batch entity (`PartitionKey: "batch"`, `RowKey: "{batchId}"`):
+Used by `IBatchTracker` / `TableBatchTracker`. Connection: `AzureWebJobsStorage`.
+
+**Batch entity** (`PartitionKey: "batch"`, `RowKey: "{batchId}"`):
 - Status: `Queued` | `Processing` | `Processed` | `Error`
 - PaymentCount, CreatedAt, CompletedAt
 
-Payment entity (`PartitionKey: "{batchId}"`, `RowKey: "{paymentId}"`, `EntityType: "payment"`):
-- All `PaymentData` fields stored (PaymentId, PayorName, PayeeName, Amount, AccountNumber, RoutingNumber, PaymentDate)
+**Payment entity** (`PartitionKey: "{batchId}"`, `RowKey: "{paymentId}"`, `EntityType: "payment"`):
+- All `PaymentData` fields (PaymentId, PayorName, PayeeName, Amount, AccountNumber, RoutingNumber, PaymentDate)
 - Status: `Queued` | `Processed` | `Error`
 - CreatedAt
 
-## How Durable Functions Work Behind the Scenes
+### BatchPayments table (App 2 — `Fin/BatchPaymentStore.cs`)
 
-The orchestration in `BatchOrchestration.cs` uses Azure Durable Functions, which is built on an event-sourcing pattern backed by Azure Storage. Here's what happens internally.
+Used by `IBatchPaymentStore` / `TableBatchPaymentStore`. Connection: `BatchStorageConnection`.
 
-> **Microsoft docs**: [Durable orchestrations (replay, event sourcing, deterministic constraints)](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-orchestrations) | [Task hubs (internal storage layout)](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-task-hubs) | [Performance and scale (dispatcher, partitions, concurrency)](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-perf-and-scale)
+**Metadata entity** (`PartitionKey: "metadata"`, `RowKey: "{batchId}"`):
+- CallbackUrl, PaymentCount, CreatedAt
 
-### The 202 Accepted is your code, not the framework
-
-The Durable Functions framework does not automatically intercept HTTP requests. In this project, `ReceiveBatchRequest` (`BatchProcessor.cs`) is a regular HTTP-triggered function that validates the request, queues a message via `IMessageQueue` (`MessageQueue.cs`), and explicitly returns 202. The orchestrator (`BatchOrchestration` in `BatchOrchestration.cs`) and its activities don't return HTTP responses at all — they communicate through internal storage infrastructure.
-
-### Starting an orchestration
-
-When `ProcessBatchQueue` (`BatchProcessor.cs`) calls `ScheduleNewOrchestrationInstanceAsync`, the Durable Task Framework:
-
-1. Writes an **ExecutionStarted** event to the **history table** in your storage account
-2. Enqueues a message onto an **internal control queue** (e.g., `<taskhub>-control-00`)
-3. Returns immediately — the orchestrator hasn't executed yet
-
-### The dispatcher (invisible background loop)
-
-The Durable Task Framework runs a **dispatcher** as a background service inside the function app host. It:
-
-- **Polls internal control queues** continuously
-- When it dequeues a message, it **replays** the orchestrator function (`BatchOrchestration.RunOrchestrator` in `BatchOrchestration.cs`) from the beginning
-- Each `CallActivityAsync` is checked against the **history table**:
-  - Result already in history → return cached result (replay, no execution)
-  - Not in history → enqueue a **work item** to the internal work-item queue, then **suspend** the orchestrator
-- When an activity completes, its result is written to history, and a control queue message wakes the orchestrator for another replay
-
-### Internal storage layout
-
-All of these are created automatically in your `AzureWebJobsStorage` account:
-
-| Storage artifact | Purpose |
-|---|---|
-| `<taskhub>Instances` table | Orchestration metadata (status, input, output, timestamps) |
-| `<taskhub>History` table | Event sourcing log — every activity scheduled, completed, failed |
-| `<taskhub>-control-00` through `-03` queues | Control messages that wake up orchestrators |
-| `<taskhub>-workitems` queue | Messages that trigger activity function execution |
-| `<taskhub>-leases` blob container | Partition lease management for scale-out |
-
-### The replay model
-
-This is why orchestrator functions must be **deterministic** (no `DateTime.Now`, no random values, no direct I/O):
-
-```
-ProcessBatchQueue (BatchProcessor.cs)
-    │
-    ▼ ScheduleNewOrchestrationInstanceAsync()
-    │
-    ├── writes ExecutionStarted to History table
-    └── enqueues to control queue
-              │
-              ▼
-    [Dispatcher — invisible background loop]
-              │
-              ├── dequeues control message
-              ├── replays BatchOrchestration.RunOrchestrator (BatchOrchestration.cs)
-              ├── hits CallActivityAsync → checks history
-              │       │
-              │       ├── cached? → return result, continue
-              │       └── not cached? → enqueue to workitems queue, suspend
-              │                              │
-              │                              ▼
-              │                    [Activity runs as separate function invocation]
-              │                    e.g. CreatePaymentFile, UploadFile (BatchOrchestration.cs)
-              │                              │
-              │                              └── writes result to History table
-              │                                   enqueues control message
-              │                                        │
-              └────────────────────────────────────────┘
-                        (loop until orchestrator completes)
-```
-
-For example, when `BatchOrchestration.RunOrchestrator` (`BatchOrchestration.cs`) hits `CallActivityAsync(nameof(CreatePaymentFile), ...)`:
-
-- **First execution**: No history exists for this call → framework enqueues a work-item → orchestrator suspends → `CreatePaymentFile` (`BatchOrchestration.cs`) runs as a separate function invocation → result saved to history → control queue message wakes the orchestrator
-- **Replay**: History has the result → `CallActivityAsync` returns the cached result immediately → orchestrator continues to the next `CallActivityAsync` (e.g., `UploadFile`)
-
-The orchestrator replays from the top every time it wakes up. Each completed activity is replayed from cache until the orchestrator reaches the next unfinished step.
-
-### Activity retry policies
-
-> **Microsoft docs**: [Handling errors and retries](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-error-handling)
-
-When you pass a `RetryPolicy` to `CallActivityAsync`, the framework handles all retry logic automatically — your orchestrator code doesn't loop or sleep.
-
-```csharp
-private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
-    maxNumberOfAttempts: 3,
-    firstRetryInterval: TimeSpan.FromSeconds(5)));
-```
-
-`RetryPolicy` supports these parameters:
-
-| Parameter | Default | Description |
-|---|---|---|
-| `maxNumberOfAttempts` | (required) | Total attempts including the first try |
-| `firstRetryInterval` | (required) | Delay before the first retry |
-| `backoffCoefficient` | `1.0` | Multiplier applied to the interval after each retry (e.g., `2.0` = exponential backoff) |
-| `maxRetryInterval` | none | Cap on the retry interval when using a backoff coefficient |
-| `retryTimeout` | none | Total time budget — stops retrying even if attempts remain |
-
-Here's what happens internally when an activity fails and has a retry policy:
-
-1. The activity throws an exception → framework records a **TaskFailed** event in the history table
-2. The framework checks the retry policy — attempts remaining? within timeout?
-3. If yes → it creates a **durable timer** (a scheduled control queue message) for the retry interval
-4. When the timer fires → the dispatcher replays the orchestrator, which re-dispatches the activity as a new work-item
-5. Each retry is a **separate activity invocation** — the orchestrator stays suspended the entire time
-6. If all retries are exhausted → the framework raises `TaskFailedException` back to the orchestrator
-
-The orchestrator does not replay during retries. It only wakes up once the activity either succeeds or exhausts all attempts.
-
-### Resilience and crash recovery
-
-The Durable Task Framework provides **at-least-once execution** guarantees. Because all state lives in Azure Storage (not in memory), orchestrations survive host crashes, restarts, and scale events:
-
-**Host crashes mid-activity**: The work-item queue message has a visibility timeout (default 5 minutes, configured in `host.json` under `extensions.queues.visibilityTimeout`). If the host crashes before the activity completes, the message becomes visible again after the timeout expires, and another host instance picks it up and re-executes the activity.
-
-**Host crashes mid-orchestrator-replay**: Same mechanism via the control queue. The control queue message becomes visible again, and the orchestrator is replayed from the beginning — all previously completed activities return their cached results instantly.
-
-**Host restarts**: When the function app restarts, the dispatcher resumes polling the control and work-item queues. Any in-flight orchestrations or activities continue from where they left off. No manual intervention needed.
-
-**Durable timers survive restarts**: Timer-based delays (including retry backoff intervals) are stored as scheduled messages in the control queue. They fire on schedule regardless of whether the host was running when they were created.
-
-**Duplicate execution protection**: Activity results are recorded in the history table before the orchestrator is notified. If an activity completes but the host crashes before the result is processed, the orchestrator will replay and see the cached result — it won't re-execute the activity.
-
-### Persisted orchestration data
-
-The original input passed to `ScheduleNewOrchestrationInstanceAsync` (called by `ProcessBatchQueue` in `BatchProcessor.cs`) is stored in the `Instances` table as `SerializedInput`. This means the full `BatchRequest` (`Models.cs`) — batch ID, all 10 payments, and the callback URL — is persisted for the lifetime of the orchestration instance.
-
-You can retrieve it programmatically:
-
-```csharp
-var metadata = await durableClient.GetInstanceAsync("batch-{batchId}", getInputsAndOutputs: true);
-var originalRequest = metadata.ReadInputAs<BatchRequest>();
-// originalRequest.BatchId, originalRequest.Payments, originalRequest.CallbackUrl are all available
-```
-
-The `getInputsAndOutputs: true` flag is required — without it, `SerializedInput` is null and `ReadInputAs<T>()` throws `InvalidOperationException`.
-
-`OrchestrationMetadata` also exposes:
-
-| Property | Description |
-|---|---|
-| `InstanceId` | The orchestration instance ID (e.g., `batch-abc12345`) |
-| `RuntimeStatus` | `Pending`, `Running`, `Completed`, `Failed`, `Terminated`, `Suspended` |
-| `CreatedAt` | When the orchestration was scheduled |
-| `LastUpdatedAt` | Last state change |
-| `SerializedInput` | The raw JSON input (requires `getInputsAndOutputs: true`) |
-| `SerializedOutput` | The raw JSON return value (requires `getInputsAndOutputs: true`) |
-| `FailureDetails` | Exception info for `Failed` orchestrations |
-| `IsRunning` / `IsCompleted` | Convenience booleans |
-
-### Instance management API (`DurableTaskClient`)
-
-> **Microsoft docs**: [Manage orchestration instances](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-instance-management)
-
-The `DurableTaskClient` (injected via `[DurableClient]`) exposes these management methods:
-
-| Method | Description |
-|---|---|
-| `GetInstanceAsync(id, getInputsAndOutputs)` | Retrieve orchestration metadata, optionally with input/output data |
-| `TerminateInstanceAsync(id, reason)` | Send a terminate message to a running orchestration. Does not cancel in-flight activities — they finish but their results are discarded |
-| `SuspendInstanceAsync(id, reason)` | Pause a running orchestration — it stops processing control queue messages until resumed |
-| `ResumeInstanceAsync(id, reason)` | Resume a suspended orchestration |
-| `PurgeInstanceAsync(id)` | Delete all data (Instances + History) for a terminal orchestration (Completed, Failed, or Terminated). Required before reusing a deterministic instance ID |
-| `PurgeAllInstancesAsync(filter)` | Bulk purge by status, date range, etc. |
-| `GetAllInstancesAsync(query)` | Query instances by status, date range, instance ID prefix |
-
-### Built-in HTTP management endpoints
-
-> **Microsoft docs**: [HTTP APIs in Durable Functions](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-http-api)
-
-The Durable Task Framework exposes management endpoints automatically — no custom code needed. Locally they're at `http://localhost:7071/runtime/webhooks/durableTask/instances/{instanceId}`.
-
-```bash
-# Check the status of an orchestration (add ?showInput=true for the original payload)
-curl http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}
-
-# Check status with the full input/output
-curl "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}?showInput=true&showOutput=true"
-
-# Terminate a running orchestration
-curl -X POST \
-  "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}/terminate?reason=manual"
-
-# Suspend a running orchestration (can be resumed later)
-curl -X POST \
-  "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}/suspend?reason=investigating"
-
-# Resume a suspended orchestration
-curl -X POST \
-  "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}/resume?reason=issue+resolved"
-
-# Purge a completed/failed/terminated instance
-curl -X DELETE \
-  http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}
-
-# Then re-submit the batch to start a fresh orchestration
-curl -X POST http://localhost:7071/api/batch/process \
-  -H "Content-Type: application/json" \
-  -d '{ "batchId": "...", "payments": [...], "callbackUrl": "..." }'
-```
-
-The purge deletes the instance from the `Instances` and `History` tables, so `ScheduleNewOrchestrationInstanceAsync` will accept the same ID again.
-
-### Retrying a failed batch manually
-
-Because this project uses deterministic instance IDs (`batch-{batchId}`), you can't just re-submit a batch — the framework will reject the duplicate ID. There are two approaches:
-
-**Option 1: Purge and re-submit (using the HTTP management API)**
-
-This is the simplest approach and requires no code changes:
-
-```bash
-# 1. Check the current status
-curl "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-abc12345?showInput=true"
-
-# 2. Purge the old instance
-curl -X DELETE http://localhost:7071/runtime/webhooks/durableTask/instances/batch-abc12345
-
-# 3. Re-submit (copy the original input from step 1, or reconstruct it)
-curl -X POST http://localhost:7071/api/batch/process \
-  -H "Content-Type: application/json" \
-  -d '{ "batchId": "abc12345", "payments": [...], "callbackUrl": "http://..." }'
-```
-
-**Option 2: Custom retry endpoint (reads the persisted input automatically)**
-
-A custom endpoint can read the original `BatchRequest` from the orchestration's persisted input, purge the old instance, and re-start — all in one call:
-
-```csharp
-// POST /api/batch/retry/{batchId}
-[Function(nameof(RetryBatch))]
-public async Task<HttpResponseData> RetryBatch(
-    [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "batch/retry/{batchId}")] HttpRequestData req,
-    string batchId,
-    [DurableClient] DurableTaskClient durableClient,
-    FunctionContext executionContext)
-{
-    string instanceId = $"batch-{batchId}";
-    var metadata = await durableClient.GetInstanceAsync(instanceId, getInputsAndOutputs: true);
-
-    if (metadata is null)
-        return /* 404: no orchestration found for this batch */;
-
-    if (metadata.IsRunning)
-        return /* 409: orchestration is still running */;
-
-    // Read the original BatchRequest from persisted input
-    var originalRequest = metadata.ReadInputAs<BatchRequest>();
-
-    // Purge the old instance so the ID can be reused
-    await durableClient.PurgeInstanceAsync(instanceId);
-
-    // Re-start with the same input and deterministic ID
-    await durableClient.ScheduleNewOrchestrationInstanceAsync(
-        nameof(BatchOrchestration), originalRequest,
-        new StartOrchestrationOptions { InstanceId = instanceId });
-
-    return /* 202: retrying batch {batchId} */;
-}
-```
-
-This approach is useful because you don't need to reconstruct or re-supply the payment data — it's already stored in the Durable Functions infrastructure.
-
-**Important note on orchestration status**: In this project, the orchestrator catches all `TaskFailedException` errors and returns a result string. This means even when uploads fail, the orchestration status is `Completed` (not `Failed`) — the error is handled as business logic. Both approaches above work regardless of whether the orchestration is `Completed` or `Failed`, since purge accepts any terminal status.
+**Payment entity** (`PartitionKey: "{batchId}"`, `RowKey: "{paymentId}"`, `EntityType: "payment"`):
+- All `PaymentData` fields (PaymentId, PayorName, PayeeName, Amount, AccountNumber, RoutingNumber, PaymentDate)
+- CreatedAt
 
 ## Storage
 
@@ -419,45 +164,46 @@ The POC uses a single `AzureWebJobsStorage` connection string for simplicity. In
 | Service | POC | Production | Purpose |
 |---|---|---|---|
 | **Durable Functions** (blob/table) | `AzureWebJobsStorage` | `AzureWebJobsStorage` | Orchestration state, history, checkpoints — managed by the runtime |
-| **Table Storage** (`BatchTracking`) | `AzureWebJobsStorage` | Dedicated storage account | Batch metadata and payment status tracking — application data |
-| **Queue Storage** (`batch-processing-queue`, `gl-error-queue`) | `BatchStorageConnection` | Dedicated storage account | Decouples HTTP acceptance from orchestration — application data |
+| **Table Storage** (`BatchTracking`) | `AzureWebJobsStorage` | Dedicated storage account | App 1 batch metadata and payment status tracking |
+| **Table Storage** (`BatchPayments`) | `BatchStorageConnection` | Dedicated storage account | App 2 payment data for file generation |
+| **Queue Storage** (`batch-processing-queue`, `gl-error-queue`) | `BatchStorageConnection` | Dedicated storage account | Decouples HTTP acceptance from orchestration |
 
 **Why separate?** `AzureWebJobsStorage` is the function app's internal storage — it holds lease blobs, host IDs, durable task history, and other runtime state. Mixing application tables and queues into this account couples your data to the runtime's lifecycle and makes independent management (backup, scaling, access control) harder.
 
-**Local development**: All services point to Azurite (`UseDevelopmentStorage=true`) on ports 10000 (blob), 10001 (queue), 10002 (table). No separation needed locally.
+**Local development**: All services point to Azurite (`UseDevelopmentStorage=true`) on ports 10000 (blob), 10001 (queue), 10002 (table).
 
 ## Functions
 
-### App 1 — Coordinator (`BatchCoordinator.cs`)
+### App 1 — GM Coordinator (`GM/BatchCoordinator.cs`)
 
 | Function | Trigger | Description |
 |---|---|---|
-| `RunDataFeed` | Timer (daily) | Generates batch of 10 fake ACH payments, creates batch + payment entities via `IBatchTracker`, POSTs batch to `ReceiveBatchRequest` |
+| `RunDataFeed` | Timer (daily) | Generates batch of 10 fake ACH payments, creates entities via `IBatchTracker`, POSTs batch to App 2 |
 | `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as `RunDataFeed` but returns `{ batchId }` — used by E2E test script |
 | `BatchCompleted` | HTTP POST `/api/batch/callback` | Receives `BatchCallback`, updates batch status via `IBatchTracker` |
-| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + payment statuses from Table Storage via `IBatchTracker` |
+| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + payment statuses from `BatchTracking` table |
 | `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in `BatchTracking` table |
 
-### App 2 — Entry Points (`BatchProcessor.cs`)
+### App 2 — Fin Entry Points (`Fin/BatchProcessor.cs`)
 
 | Function | Trigger | Description |
 |---|---|---|
-| `ReceiveBatchRequest` | HTTP POST `/api/batch/process` | Validates `BatchRequest`, drops onto `batch-processing-queue` via `IMessageQueue`, returns 202 |
-| `ProcessBatchQueue` | Queue `batch-processing-queue` | Starts `BatchOrchestration` via `DurableTaskClient` with deterministic instance ID `batch-{batchId}` |
+| `ReceiveBatchRequest` | HTTP POST `/api/batch/process` | Validates request, stores in `BatchPayments` table, enqueues `BatchQueueMessage`, returns 202 |
+| `ProcessBatchQueue` | Queue `batch-processing-queue` | Reads callback URL from `BatchPayments` table, starts `BatchOrchestration` with `BatchOrchestrationInput` |
 | `ProcessGLErrorQueue` | Queue `gl-error-queue` | Logs failed GL uploads (TODO: error email, manual retry endpoint) |
 
-### App 2 — Orchestrator + Activities (`BatchOrchestration.cs`)
+### App 2 — Fin Orchestrator + Activities (`Fin/BatchOrchestration.cs`)
 
 | Function | Type | Description |
 |---|---|---|
-| `BatchOrchestration` | Orchestrator | Calls activities sequentially: payment file → upload → GL file → upload → callback |
-| `CreatePaymentFile` | Activity | Builds payment CSV string from `BatchRequest.Payments` (all fields including account/routing) |
-| `CreateGLFile` | Activity | Builds GL CSV string from `BatchRequest.Payments` (excludes sensitive banking fields) |
+| `BatchOrchestration` | Orchestrator | Receives `BatchOrchestrationInput(BatchId, CallbackUrl)`. Calls activities sequentially: payment file → upload → GL file → upload → callback |
+| `CreatePaymentFile` | Activity | Reads payments from `BatchPayments` table via `IBatchPaymentStore`, builds payment CSV (all fields including account/routing) |
+| `CreateGLFile` | Activity | Reads payments from `BatchPayments` table via `IBatchPaymentStore`, builds GL CSV (excludes sensitive banking fields) |
 | `UploadFile` | Activity | Connects to SFTP via `ISftpClientFactory`, uploads file content. Used for both payment and GL files |
 | `SendCallback` | Activity | POSTs `BatchCallback` to the `CallbackUrl` via `IHttpClientFactory` |
 | `SendToGLErrorQueue` | Activity | Queues `GLErrorMessage` to `gl-error-queue` via `IGLErrorQueue` |
 
-### Testing / Verification (`SftpEndpoints.cs`)
+### Testing / Debug Endpoints (`Fin/SftpEndpoints.cs`)
 
 | Function | Trigger | Description |
 |---|---|---|
@@ -465,93 +211,12 @@ The POC uses a single `AzureWebJobsStorage` connection string for simplicity. In
 | `Sftp_GetFile` | HTTP GET `/api/sftp/files/{fileName}` | Returns contents of a file from the SFTP server |
 | `Sftp_DeleteAllFiles` | HTTP DELETE `/api/sftp/files` | Deletes all files on SFTP server |
 
-## Data Feed
+## API Reference
 
-The `BatchCoordinator` class (`BatchCoordinator.cs`) acts as the coordinator. It generates fake ACH payment data using [Bogus](https://github.com/bchavez/Bogus) and submits batches for SFTP processing.
+### POST /api/batch/process
 
-### What it does
+Handled by `ReceiveBatchRequest` (`Fin/BatchProcessor.cs`). Body is `BatchRequest` (`Models/Models.cs`):
 
-`RunDataFeed` (Timer) and `TriggerDataFeed` (HTTP) share the same `GenerateBatch` private method:
-
-1. Generates 10 random ACH payments using Bogus (payor, payee, amount, account/routing numbers, date)
-2. Creates a batch entity and 10 payment entities in Table Storage via `IBatchTracker` (`BatchTracking.cs`)
-3. Queries all Queued payments for the batch from Table Storage via `IBatchTracker.GetQueuedPaymentsAsync` (picks up orphaned payments from a prior failed run)
-4. POSTs the entire batch as a `BatchRequest` to `ReceiveBatchRequest` (`BatchProcessor.cs`) at `POST /api/batch/process`
-5. On successful submission, sets batch status to Processing via `IBatchTracker.UpdateBatchStatusAsync`
-6. On submission failure, sets batch status to Error
-
-`BatchCompleted` receives callbacks from `SendCallback` (`BatchOrchestration.cs`):
-
-7. Processed → logs info (TODO: notify third party)
-8. Error → logs warning (TODO: send alert email)
-
-### Triggering manually
-
-Via the admin endpoint (invokes `RunDataFeed` in `BatchCoordinator.cs` directly):
-
-```bash
-curl -X POST http://localhost:7071/admin/functions/RunDataFeed \
-  -H "Content-Type: application/json" -d '{}'
-```
-
-Or via the HTTP endpoint (invokes `TriggerDataFeed` in `BatchCoordinator.cs`, returns `{ batchId }`):
-
-```bash
-curl -X POST http://localhost:7071/api/datafeed/trigger
-```
-
-### Configuration
-
-| Variable | Required | Description |
-|---|---|---|
-| `PROCESSOR_BASE_URL` | Yes | Base URL of the SFTP processor (e.g., `http://localhost:7071`) |
-| `COORDINATOR_BASE_URL` | Yes | Base URL of the coordinator, used to build callback URLs |
-
-## Batch Orchestration (`BatchOrchestration.cs`)
-
-### How it works
-
-`BatchOrchestration.RunOrchestrator` receives a `BatchRequest` (`Models.cs`) containing a batch ID, list of payments, and a callback URL. It calls activities **sequentially**:
-
-1. `CreatePaymentFile` — builds a payment CSV (all fields including account/routing numbers)
-2. `UploadFile` — uploads payment CSV to SFTP via `ISftpClientFactory` (`SftpClientFactory.cs`), retry policy: 3 attempts, 5s backoff
-   - If `UploadFile` fails after retries → `SendCallback` with Error status, return early (no GL attempt)
-3. `CreateGLFile` — builds a GL CSV (excludes sensitive banking fields)
-4. `UploadFile` — uploads GL CSV to SFTP, same retry policy
-   - If `UploadFile` fails after retries → `SendToGLErrorQueue` queues to `gl-error-queue` via `IGLErrorQueue` (`MessageQueue.cs`), no callback (App 1 stays in Processing)
-5. If both succeed → `SendCallback` with Processed status
-
-### Request flow
-
-```
-ReceiveBatchRequest (BatchProcessor.cs) — POST /api/batch/process
-  └─► 202 Accepted + message on batch-processing-queue via IMessageQueue (MessageQueue.cs)
-        │
-        ▼
-ProcessBatchQueue (BatchProcessor.cs) — queue trigger: batch-processing-queue
-        │
-        ▼
-BatchOrchestration.RunOrchestrator (BatchOrchestration.cs) — deterministic ID: batch-{batchId}
-        │
-        ▼
-  CreatePaymentFile → UploadFile (payment CSV, with retry)
-        │
-        ├── failure → SendCallback(Error), return early
-        │
-        ▼
-  CreateGLFile → UploadFile (GL CSV, with retry)
-        │
-        ├── failure → SendToGLErrorQueue, no callback
-        │
-        ▼
-  SendCallback(Processed)
-
-  All activities above are in BatchOrchestration.cs
-```
-
-### Request schema (`Models.cs`)
-
-**POST /api/batch/process** — handled by `ReceiveBatchRequest` (`BatchProcessor.cs`), body is `BatchRequest`:
 ```json
 {
   "batchId": "string",
@@ -570,7 +235,10 @@ BatchOrchestration.RunOrchestrator (BatchOrchestration.cs) — deterministic ID:
 }
 ```
 
-**Callback payload** — sent by `SendCallback` (`BatchOrchestration.cs`) to `BatchCompleted` (`BatchCoordinator.cs`), body is `BatchCallback`:
+### POST /api/batch/callback
+
+Sent by `SendCallback` (`Fin/BatchOrchestration.cs`) to `BatchCompleted` (`GM/BatchCoordinator.cs`). Body is `BatchCallback`:
+
 ```json
 {
   "batchId": "string",
@@ -578,43 +246,17 @@ BatchOrchestration.RunOrchestrator (BatchOrchestration.cs) — deterministic ID:
 }
 ```
 
-### Error handling
+## Configuration
 
-- **Payment `UploadFile` failure** (`BatchOrchestration.cs`): Activity retry policy (3 attempts, 5s backoff). If all retries fail, `SendCallback` sends Error to `BatchCompleted` (`BatchCoordinator.cs`) and the orchestrator returns early — `CreateGLFile` is never called.
-- **GL `UploadFile` failure** (`BatchOrchestration.cs`): Activity retry policy (3 attempts, 5s backoff). If all retries fail, `SendToGLErrorQueue` queues a `GLErrorMessage` to `gl-error-queue`. No callback is sent — batch stays in Processing until manual retry.
-- **`SendCallback` failure** (`BatchOrchestration.cs`): Has its own retry policy (3 attempts, 5s backoff). If the callback to `BatchCompleted` fails after retries, the batch gets stuck in Processing (see open TODOs).
-- **Queue delivery failure**: `ProcessBatchQueue` (`BatchProcessor.cs`) retries up to 5x (`maxDequeueCount` in `host.json`), then Azure moves the message to `batch-processing-queue-poison`.
-- **Duplicate orchestration**: `ProcessBatchQueue` (`BatchProcessor.cs`) sets the instance ID to `batch-{batchId}`, making duplicate starts a no-op.
-- **Idempotent batch status**: `UpdateBatchStatusAsync` in `TableBatchTracker` (`BatchTracking.cs`) skips updates if the batch is already in a terminal state.
-
-### Viewing files on the SFTP server
-
-There are three ways to see what's been uploaded:
-
-**Via the API (easiest)** — uses `Sftp_ListFiles` and `Sftp_GetFile` (`SftpEndpoints.cs`):
-
-```bash
-# List all files on the SFTP server (Sftp_ListFiles)
-curl http://localhost:7071/api/sftp/files
-
-# Read a specific file's contents (Sftp_GetFile)
-curl http://localhost:7071/api/sftp/files/{fileName}
-```
-
-**On the host filesystem (volume mount):**
-
-```bash
-ls ./sftp-data/
-cat ./sftp-data/payment_abc12345.csv
-```
-
-**Via SSH into the container:**
-
-```bash
-ssh -p 2222 testuser@localhost
-# password: testpass
-ls /config/upload/
-```
+| Variable | Required | Default | Used by |
+|---|---|---|---|
+| `PROCESSOR_BASE_URL` | Yes | — | App 1 — base URL of the batch processor |
+| `COORDINATOR_BASE_URL` | Yes | — | App 1 — used to build callback URLs |
+| `SFTP_HOST` | Yes | — | App 2 — SFTP server hostname |
+| `SFTP_PORT` | No | `22` | App 2 — SFTP server port |
+| `SFTP_USERNAME` | Yes | — | App 2 — login username |
+| `SFTP_PASSWORD` | Yes | — | App 2 — login password |
+| `SFTP_REMOTE_PATH` | No | `/upload` | App 2 — remote directory for uploads (local dev uses `/config/upload`) |
 
 ## Testing
 
@@ -630,20 +272,20 @@ dotnet test tests/AzFunctions.Tests/ --collect:"XPlat Code Coverage"    # with c
 **Option A: Trigger a batch and check status**
 
 ```bash
-# 1. TriggerDataFeed (BatchCoordinator.cs) — returns the batchId
+# 1. TriggerDataFeed — returns the batchId
 curl -s -X POST http://localhost:7071/api/datafeed/trigger | python3 -m json.tool
 
-# 2. GetBatchStatus (BatchCoordinator.cs) — replace BATCH_ID
+# 2. GetBatchStatus — replace BATCH_ID
 curl -s http://localhost:7071/api/batch/BATCH_ID | python3 -m json.tool
 
-# 3. Sftp_ListFiles (SftpEndpoints.cs) — check uploaded files
+# 3. Sftp_ListFiles — check uploaded files
 curl -s http://localhost:7071/api/sftp/files | python3 -m json.tool
 
-# 4. Sftp_GetFile (SftpEndpoints.cs) — read a specific file
+# 4. Sftp_GetFile — read a specific file
 curl -s http://localhost:7071/api/sftp/files/payment_BATCH_ID.csv
 ```
 
-**Option B: Submit a batch directly to `ReceiveBatchRequest` (`BatchProcessor.cs`)**
+**Option B: Submit a batch directly to App 2**
 
 ```bash
 curl -s -X POST http://localhost:7071/api/batch/process \
@@ -660,11 +302,35 @@ curl -s -X POST http://localhost:7071/api/batch/process \
 **Cleanup endpoints** (useful between manual test runs):
 
 ```bash
-# ClearBatchData (BatchCoordinator.cs) — clear batch tracking data
+# ClearBatchData — clear batch tracking data
 curl -s -X DELETE http://localhost:7071/api/batch
 
-# Sftp_DeleteAllFiles (SftpEndpoints.cs) — clear SFTP files
+# Sftp_DeleteAllFiles — clear SFTP files
 curl -s -X DELETE http://localhost:7071/api/sftp/files
+```
+
+### Viewing SFTP files
+
+**Via the API** — uses `Sftp_ListFiles` and `Sftp_GetFile` (`Fin/SftpEndpoints.cs`):
+
+```bash
+curl http://localhost:7071/api/sftp/files
+curl http://localhost:7071/api/sftp/files/{fileName}
+```
+
+**On the host filesystem** (volume mount):
+
+```bash
+ls ./sftp-data/
+cat ./sftp-data/payment_abc12345.csv
+```
+
+**Via SSH into the container:**
+
+```bash
+ssh -p 2222 testuser@localhost
+# password: testpass
+ls /config/upload/
 ```
 
 ### End-to-end test
@@ -703,8 +369,8 @@ Step 3: Polling batch status from Table Storage...
 
   Payment Status (from BatchTracking table):
   -------------------------------------------
-  pmt-000      Queued
-  pmt-001      Queued
+  pmt-000      Processed
+  pmt-001      Processed
   ...
 
 Step 4: Verifying SFTP files...
@@ -717,20 +383,6 @@ Summary:
 
   Result: PASS
 ```
-
-## SFTP via SSH.NET (`SftpClientFactory.cs`)
-
-SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory` (`SftpClientFactory.cs`). The factory reads SFTP config from environment variables once at startup, validates the port, and creates connected `SftpClient` instances. The `UploadFile` activity (`BatchOrchestration.cs`) creates a new connection per invocation — pooling is not feasible across Durable Functions activity invocations.
-
-### Configuration
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `SFTP_HOST` | Yes | — | SFTP server hostname |
-| `SFTP_PORT` | No | `22` | SFTP server port |
-| `SFTP_USERNAME` | Yes | — | Login username |
-| `SFTP_PASSWORD` | Yes | — | Login password |
-| `SFTP_REMOTE_PATH` | No | `/upload` | Remote directory for uploads (local dev uses `/config/upload` — see `local.settings.json`) |
 
 ## Docker Services
 
@@ -749,7 +401,277 @@ SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`
 | Password | `testpass` |
 | Upload path | `/config/upload` |
 
-### Data directories (gitignored)
+---
 
-- `.azurite/` — Azurite storage data
-- `sftp-data/` — Files uploaded via SFTP
+# Reference: Durable Functions Internals
+
+Everything below is reference material on how Azure Durable Functions work behind the scenes. It is not specific to this application's business logic.
+
+## How Durable Functions Work Behind the Scenes
+
+The orchestration in `Fin/BatchOrchestration.cs` uses Azure Durable Functions, which is built on an event-sourcing pattern backed by Azure Storage. Here's what happens internally.
+
+> **Microsoft docs**: [Durable orchestrations (replay, event sourcing, deterministic constraints)](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-orchestrations) | [Task hubs (internal storage layout)](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-task-hubs) | [Performance and scale (dispatcher, partitions, concurrency)](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-perf-and-scale)
+
+### The 202 Accepted is your code, not the framework
+
+The Durable Functions framework does not automatically intercept HTTP requests. In this project, `ReceiveBatchRequest` (`Fin/BatchProcessor.cs`) is a regular HTTP-triggered function that validates the request, stores data in Table Storage, queues a reference message, and explicitly returns 202. The orchestrator and its activities don't return HTTP responses at all — they communicate through internal storage infrastructure.
+
+### Starting an orchestration
+
+When `ProcessBatchQueue` (`Fin/BatchProcessor.cs`) calls `ScheduleNewOrchestrationInstanceAsync`, the Durable Task Framework:
+
+1. Writes an **ExecutionStarted** event to the **history table** in your storage account
+2. Enqueues a message onto an **internal control queue** (e.g., `<taskhub>-control-00`)
+3. Returns immediately — the orchestrator hasn't executed yet
+
+### The dispatcher (invisible background loop)
+
+The Durable Task Framework runs a **dispatcher** as a background service inside the function app host. It:
+
+- **Polls internal control queues** continuously
+- When it dequeues a message, it **replays** the orchestrator function (`BatchOrchestration.RunOrchestrator` in `Fin/BatchOrchestration.cs`) from the beginning
+- Each `CallActivityAsync` is checked against the **history table**:
+  - Result already in history → return cached result (replay, no execution)
+  - Not in history → enqueue a **work item** to the internal work-item queue, then **suspend** the orchestrator
+- When an activity completes, its result is written to history, and a control queue message wakes the orchestrator for another replay
+
+### Internal storage layout
+
+All of these are created automatically in your `AzureWebJobsStorage` account:
+
+| Storage artifact | Purpose |
+|---|---|
+| `<taskhub>Instances` table | Orchestration metadata (status, input, output, timestamps) |
+| `<taskhub>History` table | Event sourcing log — every activity scheduled, completed, failed |
+| `<taskhub>-control-00` through `-03` queues | Control messages that wake up orchestrators |
+| `<taskhub>-workitems` queue | Messages that trigger activity function execution |
+| `<taskhub>-leases` blob container | Partition lease management for scale-out |
+
+### The replay model
+
+This is why orchestrator functions must be **deterministic** (no `DateTime.Now`, no random values, no direct I/O):
+
+```
+ProcessBatchQueue (Fin/BatchProcessor.cs)
+    │
+    ▼ ScheduleNewOrchestrationInstanceAsync()
+    │
+    ├── writes ExecutionStarted to History table
+    └── enqueues to control queue
+              │
+              ▼
+    [Dispatcher — invisible background loop]
+              │
+              ├── dequeues control message
+              ├── replays BatchOrchestration.RunOrchestrator (Fin/BatchOrchestration.cs)
+              ├── hits CallActivityAsync → checks history
+              │       │
+              │       ├── cached? → return result, continue
+              │       └── not cached? → enqueue to workitems queue, suspend
+              │                              │
+              │                              ▼
+              │                    [Activity runs as separate function invocation]
+              │                    e.g. CreatePaymentFile, UploadFile (Fin/BatchOrchestration.cs)
+              │                              │
+              │                              └── writes result to History table
+              │                                   enqueues control message
+              │                                        │
+              └────────────────────────────────────────┘
+                        (loop until orchestrator completes)
+```
+
+For example, when `BatchOrchestration.RunOrchestrator` hits `CallActivityAsync(nameof(CreatePaymentFile), ...)`:
+
+- **First execution**: No history exists for this call → framework enqueues a work-item → orchestrator suspends → `CreatePaymentFile` runs as a separate function invocation → result saved to history → control queue message wakes the orchestrator
+- **Replay**: History has the result → `CallActivityAsync` returns the cached result immediately → orchestrator continues to the next `CallActivityAsync` (e.g., `UploadFile`)
+
+The orchestrator replays from the top every time it wakes up. Each completed activity is replayed from cache until the orchestrator reaches the next unfinished step.
+
+## Activity Retry Policies
+
+> **Microsoft docs**: [Handling errors and retries](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-error-handling)
+
+When you pass a `RetryPolicy` to `CallActivityAsync`, the framework handles all retry logic automatically — your orchestrator code doesn't loop or sleep.
+
+```csharp
+private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
+    maxNumberOfAttempts: 3,
+    firstRetryInterval: TimeSpan.FromSeconds(5)));
+```
+
+`RetryPolicy` supports these parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `maxNumberOfAttempts` | (required) | Total attempts including the first try |
+| `firstRetryInterval` | (required) | Delay before the first retry |
+| `backoffCoefficient` | `1.0` | Multiplier applied to the interval after each retry (e.g., `2.0` = exponential backoff) |
+| `maxRetryInterval` | none | Cap on the retry interval when using a backoff coefficient |
+| `retryTimeout` | none | Total time budget — stops retrying even if attempts remain |
+
+Here's what happens internally when an activity fails and has a retry policy:
+
+1. The activity throws an exception → framework records a **TaskFailed** event in the history table
+2. The framework checks the retry policy — attempts remaining? within timeout?
+3. If yes → it creates a **durable timer** (a scheduled control queue message) for the retry interval
+4. When the timer fires → the dispatcher replays the orchestrator, which re-dispatches the activity as a new work-item
+5. Each retry is a **separate activity invocation** — the orchestrator stays suspended the entire time
+6. If all retries are exhausted → the framework raises `TaskFailedException` back to the orchestrator
+
+The orchestrator does not replay during retries. It only wakes up once the activity either succeeds or exhausts all attempts.
+
+## Resilience and Crash Recovery
+
+The Durable Task Framework provides **at-least-once execution** guarantees. Because all state lives in Azure Storage (not in memory), orchestrations survive host crashes, restarts, and scale events:
+
+**Host crashes mid-activity**: The work-item queue message has a visibility timeout (default 5 minutes, configured in `host.json` under `extensions.queues.visibilityTimeout`). If the host crashes before the activity completes, the message becomes visible again after the timeout expires, and another host instance picks it up and re-executes the activity.
+
+**Host crashes mid-orchestrator-replay**: Same mechanism via the control queue. The control queue message becomes visible again, and the orchestrator is replayed from the beginning — all previously completed activities return their cached results instantly.
+
+**Host restarts**: When the function app restarts, the dispatcher resumes polling the control and work-item queues. Any in-flight orchestrations or activities continue from where they left off. No manual intervention needed.
+
+**Durable timers survive restarts**: Timer-based delays (including retry backoff intervals) are stored as scheduled messages in the control queue. They fire on schedule regardless of whether the host was running when they were created.
+
+**Duplicate execution protection**: Activity results are recorded in the history table before the orchestrator is notified. If an activity completes but the host crashes before the result is processed, the orchestrator will replay and see the cached result — it won't re-execute the activity.
+
+## Persisted Orchestration Data
+
+The original input passed to `ScheduleNewOrchestrationInstanceAsync` (called by `ProcessBatchQueue` in `Fin/BatchProcessor.cs`) is stored in the `Instances` table as `SerializedInput`. This means the `BatchOrchestrationInput` (`Models/Models.cs`) — batch ID and callback URL — is persisted for the lifetime of the orchestration instance. Payment data is stored separately in the `BatchPayments` table and read by activities on demand.
+
+You can retrieve the orchestration input programmatically:
+
+```csharp
+var metadata = await durableClient.GetInstanceAsync("batch-{batchId}", getInputsAndOutputs: true);
+var originalInput = metadata.ReadInputAs<BatchOrchestrationInput>();
+// originalInput.BatchId, originalInput.CallbackUrl are available
+// Payment data is in the BatchPayments table, not in the orchestration input
+```
+
+The `getInputsAndOutputs: true` flag is required — without it, `SerializedInput` is null and `ReadInputAs<T>()` throws `InvalidOperationException`.
+
+`OrchestrationMetadata` also exposes:
+
+| Property | Description |
+|---|---|
+| `InstanceId` | The orchestration instance ID (e.g., `batch-abc12345`) |
+| `RuntimeStatus` | `Pending`, `Running`, `Completed`, `Failed`, `Terminated`, `Suspended` |
+| `CreatedAt` | When the orchestration was scheduled |
+| `LastUpdatedAt` | Last state change |
+| `SerializedInput` | The raw JSON input (requires `getInputsAndOutputs: true`) |
+| `SerializedOutput` | The raw JSON return value (requires `getInputsAndOutputs: true`) |
+| `FailureDetails` | Exception info for `Failed` orchestrations |
+| `IsRunning` / `IsCompleted` | Convenience booleans |
+
+## Instance Management API (`DurableTaskClient`)
+
+> **Microsoft docs**: [Manage orchestration instances](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-instance-management)
+
+The `DurableTaskClient` (injected via `[DurableClient]`) exposes these management methods:
+
+| Method | Description |
+|---|---|
+| `GetInstanceAsync(id, getInputsAndOutputs)` | Retrieve orchestration metadata, optionally with input/output data |
+| `TerminateInstanceAsync(id, reason)` | Send a terminate message to a running orchestration. Does not cancel in-flight activities — they finish but their results are discarded |
+| `SuspendInstanceAsync(id, reason)` | Pause a running orchestration — it stops processing control queue messages until resumed |
+| `ResumeInstanceAsync(id, reason)` | Resume a suspended orchestration |
+| `PurgeInstanceAsync(id)` | Delete all data (Instances + History) for a terminal orchestration (Completed, Failed, or Terminated). Required before reusing a deterministic instance ID |
+| `PurgeAllInstancesAsync(filter)` | Bulk purge by status, date range, etc. |
+| `GetAllInstancesAsync(query)` | Query instances by status, date range, instance ID prefix |
+
+## Built-in HTTP Management Endpoints
+
+> **Microsoft docs**: [HTTP APIs in Durable Functions](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-http-api)
+
+The Durable Task Framework exposes management endpoints automatically — no custom code needed. Locally they're at `http://localhost:7071/runtime/webhooks/durableTask/instances/{instanceId}`.
+
+```bash
+# Check the status of an orchestration (add ?showInput=true for the original payload)
+curl http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}
+
+# Check status with the full input/output
+curl "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}?showInput=true&showOutput=true"
+
+# Terminate a running orchestration
+curl -X POST \
+  "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}/terminate?reason=manual"
+
+# Suspend a running orchestration (can be resumed later)
+curl -X POST \
+  "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}/suspend?reason=investigating"
+
+# Resume a suspended orchestration
+curl -X POST \
+  "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}/resume?reason=issue+resolved"
+
+# Purge a completed/failed/terminated instance
+curl -X DELETE \
+  http://localhost:7071/runtime/webhooks/durableTask/instances/batch-{batchId}
+```
+
+The purge deletes the instance from the `Instances` and `History` tables, so `ScheduleNewOrchestrationInstanceAsync` will accept the same ID again.
+
+## Retrying a Failed Batch Manually
+
+Because this project uses deterministic instance IDs (`batch-{batchId}`), you can't just re-submit a batch — the framework will reject the duplicate ID. There are two approaches:
+
+**Option 1: Purge and re-submit (using the HTTP management API)**
+
+This is the simplest approach and requires no code changes:
+
+```bash
+# 1. Check the current status
+curl "http://localhost:7071/runtime/webhooks/durableTask/instances/batch-abc12345?showInput=true"
+
+# 2. Purge the old instance
+curl -X DELETE http://localhost:7071/runtime/webhooks/durableTask/instances/batch-abc12345
+
+# 3. Re-submit (payment data is already in the BatchPayments table from the original request)
+curl -X POST http://localhost:7071/api/batch/process \
+  -H "Content-Type: application/json" \
+  -d '{ "batchId": "abc12345", "payments": [...], "callbackUrl": "http://..." }'
+```
+
+Note: Step 3 re-submits a full `BatchRequest`. `ReceiveBatchRequest` will upsert the payment data in the `BatchPayments` table (idempotent) and enqueue a new `BatchQueueMessage`.
+
+**Option 2: Custom retry endpoint (reads from Table Storage)**
+
+A custom endpoint can read the callback URL from the `BatchPayments` table, purge the old orchestration instance, and re-start — all in one call:
+
+```csharp
+// POST /api/batch/retry/{batchId}
+[Function(nameof(RetryBatch))]
+public async Task<HttpResponseData> RetryBatch(
+    [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "batch/retry/{batchId}")] HttpRequestData req,
+    string batchId,
+    [DurableClient] DurableTaskClient durableClient,
+    FunctionContext executionContext)
+{
+    string instanceId = $"batch-{batchId}";
+    var metadata = await durableClient.GetInstanceAsync(instanceId, getInputsAndOutputs: true);
+
+    if (metadata is null)
+        return /* 404: no orchestration found for this batch */;
+
+    if (metadata.IsRunning)
+        return /* 409: orchestration is still running */;
+
+    // Read the callback URL from the BatchPayments table (payment data is already there)
+    string callbackUrl = await batchPaymentStore.GetCallbackUrlAsync(batchId);
+
+    // Purge the old instance so the ID can be reused
+    await durableClient.PurgeInstanceAsync(instanceId);
+
+    // Re-start with a fresh orchestration input
+    var input = new BatchOrchestrationInput(batchId, callbackUrl);
+    await durableClient.ScheduleNewOrchestrationInstanceAsync(
+        nameof(BatchOrchestration), input,
+        new StartOrchestrationOptions { InstanceId = instanceId });
+
+    return /* 202: retrying batch {batchId} */;
+}
+```
+
+This approach is simpler than the original because payment data is already persisted in the `BatchPayments` table — the retry endpoint only needs the callback URL to construct the orchestration input.
+
+**Important note on orchestration status**: In this project, the orchestrator catches all `TaskFailedException` errors and returns a result string. This means even when uploads fail, the orchestration status is `Completed` (not `Failed`) — the error is handled as business logic. Both approaches above work regardless of whether the orchestration is `Completed` or `Failed`, since purge accepts any terminal status.

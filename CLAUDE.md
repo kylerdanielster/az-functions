@@ -16,14 +16,25 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 3. `GetBatchStatus` (HTTP GET) — returns batch + payment statuses from Table Storage
 4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)
 
-**App 2: Batch Processor** (`BatchProcessor.cs` + `BatchOrchestration.cs`)
-1. `ReceiveBatchRequest` (HTTP) — validates `BatchRequest` (BatchId, Payments, CallbackUrl), stores payment data in `BatchPayments` table via `IBatchPaymentStore`, enqueues lightweight `BatchQueueMessage` (BatchId only), returns 202
-2. `ProcessBatchQueue` (Queue Trigger) — reads callback URL from `BatchPayments` table, starts Durable Functions orchestration with `BatchOrchestrationInput` (BatchId, CallbackUrl) and deterministic ID (`batch-{batchId}`)
-3. `BatchOrchestration` (Orchestrator) — processes files **sequentially**: payment file first, then GL only if payment succeeds. Activities read payment data from `BatchPayments` table via `IBatchPaymentStore`. Callbacks for terminal states only:
-   - Payment SFTP fails → callback `Error`, return early (no GL attempt)
-   - GL SFTP succeeds → callback `Processed`
-   - GL SFTP fails → queue to `gl-error-queue`, NO callback (App 1 stays in `Processing`)
-4. `ProcessGLErrorQueue` (Queue Trigger) — logs failed GL uploads (TODO: error email, manual retry endpoint)
+**App 2: Batch Processor** (`Fin/BatchProcessor.cs` + `Fin/BatchOrchestration.cs`)
+
+App 2 data flow — how a batch request becomes uploaded CSV files:
+
+1. `ReceiveBatchRequest` (HTTP POST `/api/batch/process`) — validates `BatchRequest` (BatchId, Payments, CallbackUrl), then:
+   - **Stores** all payment data + callback URL in the `BatchPayments` table via `IBatchPaymentStore.StoreBatchAsync`
+   - **Enqueues** a lightweight `BatchQueueMessage` containing only `BatchId` (no payment data) onto `batch-processing-queue`
+   - Returns 202 Accepted
+2. `ProcessBatchQueue` (Queue Trigger on `batch-processing-queue`) — triggered by the queue message, then:
+   - Deserializes `BatchQueueMessage` to get `BatchId`
+   - **Reads** the callback URL from the `BatchPayments` table via `IBatchPaymentStore.GetCallbackUrlAsync(batchId)`
+   - Starts Durable Functions orchestration with `BatchOrchestrationInput(BatchId, CallbackUrl)` and deterministic instance ID (`batch-{batchId}`)
+3. `BatchOrchestration` (Orchestrator) — receives `BatchOrchestrationInput` (BatchId + CallbackUrl, no payment data). Processes files **sequentially** via activities:
+   - `CreatePaymentFile` activity — **reads** payments from `BatchPayments` table via `IBatchPaymentStore.GetPaymentsAsync(batchId)`, builds payment CSV
+   - `UploadFile` activity — uploads payment CSV to SFTP. If fails → `SendCallback` with `Error` status, return early (no GL attempt)
+   - `CreateGLFile` activity — **reads** payments from `BatchPayments` table (same method), builds GL CSV (omits sensitive fields)
+   - `UploadFile` activity — uploads GL CSV to SFTP. If fails → queue to `gl-error-queue`, NO callback (App 1 stays in `Processing`)
+   - `SendCallback` activity — POSTs `Processed` callback to App 1
+4. `ProcessGLErrorQueue` (Queue Trigger on `gl-error-queue`) — logs failed GL uploads (TODO: error email, manual retry endpoint)
 
 **Status flow**: `Queued` → _(App 1 sets)_ `Processing` → _(callback)_ `Processed` (success) or `Queued` → _(callback)_ `Error` (payment failure). GL failure leaves batch in `Processing` until manual retry.
 
