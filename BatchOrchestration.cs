@@ -196,7 +196,7 @@ public class BatchOrchestration(IHttpClientFactory httpClientFactory, ISftpClien
         ILogger logger = executionContext.GetLogger(nameof(SendCallback));
 
         using var httpClient = httpClientFactory.CreateClient();
-        var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Callback, JsonOptions);
+        using var response = await httpClient.PostAsJsonAsync(input.CallbackUrl, input.Callback, JsonOptions);
         response.EnsureSuccessStatusCode();
 
         logger.LogInformation("[Batch] Callback sent for batch {batchId} — status={status}.",
@@ -222,6 +222,9 @@ public class BatchOrchestration(IHttpClientFactory httpClientFactory, ISftpClien
     /// </summary>
     internal static string CsvEscape(string field)
     {
+        if (string.IsNullOrEmpty(field))
+            return field ?? "";
+
         if (field.Contains(',') || field.Contains('"') || field.Contains('\n'))
             return $"\"{field.Replace("\"", "\"\"")}\"";
         return field;

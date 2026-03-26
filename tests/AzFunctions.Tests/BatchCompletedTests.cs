@@ -1,6 +1,7 @@
 using System.Net;
 using AzFunctions.Tests.Helpers;
 using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 
 namespace AzFunctions.Tests;
 
@@ -56,5 +57,17 @@ public class BatchCompletedTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         await batchTracker.Received(1).UpdateBatchStatusAsync("batch1", BatchStatus.Processing);
+    }
+
+    [Fact]
+    public async Task TrackerThrows_PropagatesException()
+    {
+        batchTracker.UpdateBatchStatusAsync("batch1", BatchStatus.Processed)
+            .ThrowsAsync(new Exception("Storage unavailable"));
+
+        var callback = new BatchCallback("batch1", BatchStatus.Processed);
+        var req = FakeHttpRequestData.CreateWithJson(context, callback);
+
+        await Assert.ThrowsAsync<Exception>(() => CreateDataFeed().BatchCompleted(req, context));
     }
 }

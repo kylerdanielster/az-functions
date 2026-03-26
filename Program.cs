@@ -11,7 +11,11 @@ var builder = FunctionsApplication.CreateBuilder(args);
 builder.ConfigureFunctionsWebApplication();
 
 builder.Services
-    .AddHttpClient()
+    .AddHttpClient(Microsoft.Extensions.Options.Options.DefaultName, client =>
+    {
+        client.Timeout = TimeSpan.FromSeconds(30);
+    })
+    .Services
     .AddApplicationInsightsTelemetryWorkerService()
     .ConfigureFunctionsApplicationInsights();
 
@@ -21,7 +25,7 @@ builder.Services.AddSingleton<IBatchTracker>(sp =>
 {
     string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
         ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
-    var tableClient = new TableClient(connectionString, "BatchTracking");
+    var tableClient = new TableClient(connectionString, TableBatchTracker.TableName);
     tableClient.CreateIfNotExists();
     return new TableBatchTracker(tableClient);
 });

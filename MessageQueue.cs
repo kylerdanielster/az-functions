@@ -14,7 +14,7 @@ public interface IMessageQueue
 
 /// <summary>
 /// Abstraction over the GL error queue for testability.
-/// Used by <see cref="SftpOrchestration"/> to queue failed GL uploads for manual retry.
+/// Used by <see cref="BatchOrchestration"/> to queue failed GL uploads for manual retry.
 /// </summary>
 public interface IGLErrorQueue
 {

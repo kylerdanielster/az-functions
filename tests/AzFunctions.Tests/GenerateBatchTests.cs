@@ -48,7 +48,7 @@ public class GenerateBatchTests : IDisposable
 
         var response = await CreateDataFeed().TriggerDataFeed(req, context);
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         await batchTracker.Received(1).CreateBatchAsync(Arg.Any<string>(), 10);
         await batchTracker.Received(10).CreatePaymentAsync(Arg.Any<string>(), Arg.Any<PaymentData>());
         await batchTracker.Received(1).GetQueuedPaymentsAsync(Arg.Any<string>());
@@ -70,7 +70,7 @@ public class GenerateBatchTests : IDisposable
 
         var response = await CreateDataFeed().TriggerDataFeed(req, context);
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         await batchTracker.Received(1).UpdateBatchStatusAsync(Arg.Any<string>(), BatchStatus.Error);
         // Failed submit should not set Processing
         await batchTracker.DidNotReceive().UpdateBatchStatusAsync(Arg.Any<string>(), BatchStatus.Processing);

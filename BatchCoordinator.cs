@@ -43,7 +43,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
     }
 
     // TODO: Callback failure resilience (Processed/Error callbacks)
-    // Problem: If SftpOrchestration.SendCallback fails after retries for the Processed or Error
+    // Problem: If BatchOrchestration.SendCallback fails after retries for the Processed or Error
     // callback, the batch stays stuck in "Processing" forever.
     // Note: The Processing transition is handled locally (no callback dependency), so only
     // terminal-state callbacks can cause stuck batches.
@@ -163,7 +163,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
 
         string batchId = await GenerateBatchAsync(logger);
 
-        var response = req.CreateResponse(HttpStatusCode.OK);
+        var response = req.CreateResponse(HttpStatusCode.Accepted);
         await response.WriteAsJsonAsync(new { batchId });
         return response;
     }

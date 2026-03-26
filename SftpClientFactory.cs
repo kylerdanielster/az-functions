@@ -11,7 +11,7 @@ namespace AzFunctions;
 public interface ISftpClientFactory
 {
     string RemotePath { get; }
-    Task<SftpClient> CreateConnectedClientAsync();
+    Task<SftpClient> CreateConnectedClientAsync(CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -47,11 +47,11 @@ public class SftpClientFactory : ISftpClientFactory
         remotePath = Environment.GetEnvironmentVariable("SFTP_REMOTE_PATH") ?? "/upload";
     }
 
-    public async Task<SftpClient> CreateConnectedClientAsync()
+    public async Task<SftpClient> CreateConnectedClientAsync(CancellationToken cancellationToken = default)
     {
         var client = new SftpClient(host, port, username, password);
         client.OperationTimeout = SftpTimeout;
-        await client.ConnectAsync(CancellationToken.None);
+        await client.ConnectAsync(cancellationToken);
         return client;
     }
 }

@@ -38,9 +38,12 @@ public interface IBatchTracker
 /// </summary>
 public class TableBatchTracker(TableClient tableClient) : IBatchTracker
 {
+    public const string TableName = "BatchTracking";
+    private const string BatchPartitionKey = "batch";
+
     public async Task CreateBatchAsync(string batchId, int paymentCount)
     {
-        var entity = new TableEntity("batch", batchId)
+        var entity = new TableEntity(BatchPartitionKey, batchId)
         {
             ["Status"] = BatchStatus.Queued,
             ["PaymentCount"] = paymentCount,
@@ -85,7 +88,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
         TableEntity batchEntity;
         try
         {
-            var response = await tableClient.GetEntityAsync<TableEntity>("batch", batchId);
+            var response = await tableClient.GetEntityAsync<TableEntity>(BatchPartitionKey, batchId);
             batchEntity = response.Value;
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
@@ -108,13 +111,16 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
 
         if (isTerminal)
         {
+            var batch = new List<TableTransactionAction>();
             await foreach (var paymentEntity in tableClient.QueryAsync<TableEntity>(
                 filter: $"PartitionKey eq '{batchId}' and EntityType eq 'payment'"))
             {
                 paymentEntity["Status"] = status;
                 paymentEntity["CompletedAt"] = DateTimeOffset.UtcNow;
-                await tableClient.UpdateEntityAsync(paymentEntity, paymentEntity.ETag, TableUpdateMode.Replace);
+                batch.Add(new TableTransactionAction(TableTransactionActionType.UpdateReplace, paymentEntity, paymentEntity.ETag));
             }
+            if (batch.Count > 0)
+                await tableClient.SubmitTransactionAsync(batch);
         }
     }
 
@@ -142,7 +148,7 @@ public class TableBatchTracker(TableClient tableClient) : IBatchTracker
     {
         try
         {
-            var response = await tableClient.GetEntityAsync<TableEntity>("batch", batchId);
+            var response = await tableClient.GetEntityAsync<TableEntity>(BatchPartitionKey, batchId);
             return response.Value;
         }
         catch (RequestFailedException ex) when (ex.Status == 404)

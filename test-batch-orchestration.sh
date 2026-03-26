@@ -125,10 +125,44 @@ echo "  Files (SFTP):  $FILE_COUNT uploaded ($PAYMENT_COUNT payment + $GL_COUNT 
 echo "  Payments tracked:  $PAYMENT_ENTITIES"
 echo ""
 
-if [ "$FINAL_STATUS" = "Processed" ] && [ "$FILE_COUNT" -ge 2 ] && [ "$PAYMENT_ENTITIES" -ge 10 ]; then
+PROCESSED_COUNT=$(echo "$STATUS_RESPONSE" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+print(len([p for p in d.get('Payments', []) if p.get('Status') == 'Processed']))" 2>/dev/null || echo "0")
+
+PASS=true
+FAILURES=""
+
+if [ "$FINAL_STATUS" != "Processed" ]; then
+  PASS=false
+  FAILURES="$FAILURES\n    - Batch status is '$FINAL_STATUS', expected 'Processed'"
+fi
+if [ "$FILE_COUNT" -ne 2 ]; then
+  PASS=false
+  FAILURES="$FAILURES\n    - SFTP file count is $FILE_COUNT, expected exactly 2"
+fi
+if [ "$PAYMENT_COUNT" -ne 1 ]; then
+  PASS=false
+  FAILURES="$FAILURES\n    - Payment file count is $PAYMENT_COUNT, expected exactly 1"
+fi
+if [ "$GL_COUNT" -ne 1 ]; then
+  PASS=false
+  FAILURES="$FAILURES\n    - GL file count is $GL_COUNT, expected exactly 1"
+fi
+if [ "$PAYMENT_ENTITIES" -ne 10 ]; then
+  PASS=false
+  FAILURES="$FAILURES\n    - Payment entity count is $PAYMENT_ENTITIES, expected exactly 10"
+fi
+if [ "$PROCESSED_COUNT" -ne 10 ]; then
+  PASS=false
+  FAILURES="$FAILURES\n    - Processed payment count is $PROCESSED_COUNT, expected 10"
+fi
+
+if [ "$PASS" = true ]; then
   echo "  Result: PASS"
 else
   echo "  Result: FAIL"
+  echo -e "  Failures:$FAILURES"
   exit 1
 fi
 echo ""

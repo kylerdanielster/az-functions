@@ -18,7 +18,7 @@ public class SftpEndpoints(ISftpClientFactory sftpClientFactory)
         [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "sftp/files")] HttpRequestData req,
         FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger("Sftp_DeleteAllFiles");
+        ILogger logger = executionContext.GetLogger(nameof(DeleteAllFiles));
 
         try
         {
@@ -54,7 +54,7 @@ public class SftpEndpoints(ISftpClientFactory sftpClientFactory)
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "sftp/files")] HttpRequestData req,
         FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger("Sftp_ListFiles");
+        ILogger logger = executionContext.GetLogger(nameof(ListFiles));
 
         try
         {
@@ -87,7 +87,7 @@ public class SftpEndpoints(ISftpClientFactory sftpClientFactory)
         string fileName,
         FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger("Sftp_GetFile");
+        ILogger logger = executionContext.GetLogger(nameof(GetFile));
 
         if (fileName.Contains("..") || fileName.Contains('/') || fileName.Contains('\\'))
         {

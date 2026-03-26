@@ -107,7 +107,7 @@ dotnet test tests/AzFunctions.Tests/ --collect:"XPlat Code Coverage"  # with cov
 
 Test files:
 - `ReceiveBatchRequestTests.cs` — input validation (null body, missing fields, empty payments, valid request, queue message content verification)
-- `BatchCompletedTests.cs` — callback handling (Processed, Error, Processing callbacks, null request)
+- `BatchCompletedTests.cs` — callback handling (Processed, Error, Processing callbacks, null request, tracker exception propagation)
 - `GenerateBatchTests.cs` — batch submission (submit succeeds with payment entity creation, submit fails marks batch Error)
 - `BatchOrchestrationTests.cs` — sequential flow (full success, payment failure stops GL, GL failure queues error, callback failure isolation, callback payload verification)
 - `CreatePaymentFileTests.cs` — CSV generation (header, data formatting, escaping, empty list, amount formatting, sensitive field inclusion)
@@ -115,6 +115,10 @@ Test files:
 - `GetBatchStatusTests.cs` — batch status endpoint (404 path, payment assembly/ordering, completed batch, error handling)
 - `ProcessBatchQueueTests.cs` — queue trigger (valid message, null/malformed input, orchestration ID format)
 - `ProcessGLErrorQueueTests.cs` — GL error queue trigger (valid message, null message, malformed input)
+- `ClearBatchDataTests.cs` — clear endpoint (success with count, empty table, tracker exception)
+- `SftpEndpointsTests.cs` — SFTP endpoints (path traversal rejection, connection failure handling)
+- `SftpClientFactoryTests.cs` — env var validation (missing host/username/password, invalid port, default/custom remote path)
+- `CsvEscapeTests.cs` — CSV escaping (null, empty, simple, comma, quotes, newline, mixed special chars)
 - `Helpers/` — `FakeHttpRequestData`, `FakeHttpResponseData`, `FakeFunctionContext` for Azure Functions isolated worker model
 
 Tests mock `IBatchTracker`, `IMessageQueue`, `IGLErrorQueue`, `ISftpClientFactory`, and `IHttpClientFactory`. `TableBatchTracker` is tested via E2E against Azurite (not unit-tested — `TableClient` has no interface).
