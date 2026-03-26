@@ -14,7 +14,7 @@ public class ProcessBatchQueueTests
     };
 
     private readonly DurableTaskClient durableClient = Substitute.For<DurableTaskClient>("test");
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ProcessSftpQueue));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ProcessBatchQueue));
 
     [Fact]
     public async Task ValidMessage_StartsOrchestrationWithDeterministicId()
@@ -27,12 +27,12 @@ public class ProcessBatchQueueTests
 
         string messageText = JsonSerializer.Serialize(request, JsonOptions);
 
-        await BatchProcessor.ProcessSftpQueue(messageText, durableClient, context);
+        await BatchProcessor.ProcessBatchQueue(messageText, durableClient, context);
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
             nameof(BatchOrchestration),
             Arg.Any<BatchRequest>(),
-            Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "sftp-batch1"));
+            Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "batch-batch1"));
     }
 
     [Fact]
@@ -41,7 +41,7 @@ public class ProcessBatchQueueTests
         string messageText = "null";
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => BatchProcessor.ProcessSftpQueue(messageText, durableClient, context));
+            () => BatchProcessor.ProcessBatchQueue(messageText, durableClient, context));
     }
 
     [Fact]
@@ -50,7 +50,7 @@ public class ProcessBatchQueueTests
         string messageText = "not valid json";
 
         await Assert.ThrowsAsync<JsonException>(
-            () => BatchProcessor.ProcessSftpQueue(messageText, durableClient, context));
+            () => BatchProcessor.ProcessBatchQueue(messageText, durableClient, context));
     }
 
     [Fact]
@@ -64,11 +64,11 @@ public class ProcessBatchQueueTests
 
         string messageText = JsonSerializer.Serialize(request, JsonOptions);
 
-        await BatchProcessor.ProcessSftpQueue(messageText, durableClient, context);
+        await BatchProcessor.ProcessBatchQueue(messageText, durableClient, context);
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
             nameof(BatchOrchestration),
             Arg.Any<BatchRequest>(),
-            Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "sftp-abc123"));
+            Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "batch-abc123"));
     }
 }

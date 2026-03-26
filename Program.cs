@@ -63,7 +63,7 @@ lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine("    curl -s http://localhost:7071/api/batch/{batchId} | python3 -m json.tool");
     Console.WriteLine();
     Console.WriteLine("  Run E2E test:");
-    Console.WriteLine("    ./test-sftp-orchestration.sh");
+    Console.WriteLine("    ./test-batch-orchestration.sh");
     Console.WriteLine();
 });
 

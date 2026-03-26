@@ -8,7 +8,7 @@ namespace AzFunctions.Tests;
 public class ReceiveBatchRequestTests
 {
     private readonly IMessageQueue messageQueue = Substitute.For<IMessageQueue>();
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ReceiveSftpRequest));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ReceiveBatchRequest));
 
     private BatchProcessor CreateProcessor() => new(messageQueue);
 
@@ -21,7 +21,7 @@ public class ReceiveBatchRequestTests
         ], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
-        var response = await CreateProcessor().ReceiveSftpRequest(req, context);
+        var response = await CreateProcessor().ReceiveBatchRequest(req, context);
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         await messageQueue.Received(1).SendMessageAsync(Arg.Is<string>(msg =>
@@ -42,7 +42,7 @@ public class ReceiveBatchRequestTests
         string? capturedMessage = null;
         await messageQueue.SendMessageAsync(Arg.Do<string>(msg => capturedMessage = msg));
 
-        await CreateProcessor().ReceiveSftpRequest(req, context);
+        await CreateProcessor().ReceiveBatchRequest(req, context);
 
         Assert.NotNull(capturedMessage);
         var deserialized = JsonSerializer.Deserialize<BatchRequest>(capturedMessage,
@@ -60,7 +60,7 @@ public class ReceiveBatchRequestTests
     {
         var req = new FakeHttpRequestData(context, "null");
 
-        var response = await CreateProcessor().ReceiveSftpRequest(req, context);
+        var response = await CreateProcessor().ReceiveBatchRequest(req, context);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         await messageQueue.DidNotReceive().SendMessageAsync(Arg.Any<string>());
@@ -75,7 +75,7 @@ public class ReceiveBatchRequestTests
         ], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
-        var response = await CreateProcessor().ReceiveSftpRequest(req, context);
+        var response = await CreateProcessor().ReceiveBatchRequest(req, context);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         await messageQueue.DidNotReceive().SendMessageAsync(Arg.Any<string>());
@@ -87,7 +87,7 @@ public class ReceiveBatchRequestTests
         var body = new BatchRequest("batch1", [], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
-        var response = await CreateProcessor().ReceiveSftpRequest(req, context);
+        var response = await CreateProcessor().ReceiveBatchRequest(req, context);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         await messageQueue.DidNotReceive().SendMessageAsync(Arg.Any<string>());

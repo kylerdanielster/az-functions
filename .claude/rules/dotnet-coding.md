@@ -60,7 +60,7 @@ Access via `Environment.GetEnvironmentVariable()`. Use `?? throw` for required s
 
 - Use `context.CreateReplaySafeLogger()` in orchestrators — prevents duplicate logs during replay
 - Use `executionContext.GetLogger()` in activities and HTTP triggers
-- Prefix all log messages with `[SFTP]` for filtering
+- Prefix all log messages with `[Batch]` for filtering (`[SFTP]` for SFTP-specific endpoints in `SftpEndpoints.cs` and `SftpClientFactory.cs`)
 - Use `LogInformation` for milestones, `LogWarning` for non-fatal issues, `LogError` for failures
 
 ## Application Insights

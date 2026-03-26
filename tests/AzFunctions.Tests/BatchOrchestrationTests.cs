@@ -18,7 +18,7 @@ public class BatchOrchestrationTests
     private static TaskOrchestrationContext CreateMockContext()
     {
         var context = Substitute.For<TaskOrchestrationContext>();
-        context.InstanceId.Returns("sftp-batch1");
+        context.InstanceId.Returns("batch-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
         context.GetInput<BatchRequest>().Returns(new BatchRequest(
             "batch1", CreateTestPayments(), "http://localhost/callback"));

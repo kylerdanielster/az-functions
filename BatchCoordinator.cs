@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging;
 namespace AzFunctions;
 
 /// <summary>
-/// Coordinator (App 1). Generates fake ACH payment batches, submits the entire batch to the SFTP Processor,
+/// Coordinator (App 1). Generates fake ACH payment batches, submits the entire batch to the Batch Processor,
 /// and receives status callbacks to track batch progress.
 /// </summary>
 public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracker batchTracker)
@@ -23,7 +23,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
 
     /// <summary>
     /// Daily timer trigger that generates a batch of fake payments and submits the entire batch
-    /// to the SFTP Processor for CSV file creation and upload.
+    /// to the Batch Processor for CSV file creation and upload.
     /// </summary>
     [Function(nameof(RunDataFeed))]
     public async Task RunDataFeed(
@@ -38,7 +38,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "[SFTP] Data feed failed.");
+            logger.LogError(ex, "[Batch] Data feed failed.");
         }
     }
 
@@ -53,7 +53,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
     //   2. Simple timeout that marks batches stuck in "Processing" beyond a threshold as "Error".
 
     /// <summary>
-    /// Callback webhook that receives batch status updates from the SFTP Processor.
+    /// Callback webhook that receives batch status updates from the Batch Processor.
     /// Updates batch status in Table Storage.
     /// Route: POST /api/batch/callback
     /// </summary>
@@ -74,18 +74,18 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
 
         await batchTracker.UpdateBatchStatusAsync(callback.BatchId, callback.Status);
 
-        logger.LogInformation("[SFTP] Batch {batchId} callback — status={status}.",
+        logger.LogInformation("[Batch] Batch {batchId} callback — status={status}.",
             callback.BatchId, callback.Status);
 
         if (callback.Status == BatchStatus.Processed)
         {
             // TODO: Notify third party that batch payment processing is complete.
-            logger.LogInformation("[SFTP] Batch {batchId} processed — would notify third party.", callback.BatchId);
+            logger.LogInformation("[Batch] Batch {batchId} processed — would notify third party.", callback.BatchId);
         }
         else if (callback.Status == BatchStatus.Error)
         {
             // TODO: Send alert email to users notifying them of the failure.
-            logger.LogWarning("[SFTP] Batch {batchId} error — alert email not yet implemented.", callback.BatchId);
+            logger.LogWarning("[Batch] Batch {batchId} error — alert email not yet implemented.", callback.BatchId);
         }
 
         var response = req.CreateResponse(HttpStatusCode.OK);
@@ -95,7 +95,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
 
     /// <summary>
     /// Creates a batch with payment entities in Table Storage, generates fake ACH payments,
-    /// queries back only Queued payments, and POSTs the batch to the SFTP Processor.
+    /// queries back only Queued payments, and POSTs the batch to the Batch Processor.
     /// On submission failure, marks the batch as Error.
     /// </summary>
     private async Task<string> GenerateBatchAsync(ILogger logger)
@@ -108,7 +108,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
         string batchId = Guid.NewGuid().ToString("N")[..8];
         string callbackUrl = $"{coordinatorBaseUrl}/api/batch/callback";
 
-        logger.LogInformation("[SFTP] Data feed starting — batch {batchId} with {count} payments.",
+        logger.LogInformation("[Batch] Data feed starting — batch {batchId} with {count} payments.",
             batchId, BatchSize);
 
         await batchTracker.CreateBatchAsync(batchId, BatchSize);
@@ -134,17 +134,17 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
         try
         {
             var response = await httpClient.PostAsJsonAsync(
-                $"{processorBaseUrl}/api/sftp/process", request, JsonOptions);
+                $"{processorBaseUrl}/api/batch/process", request, JsonOptions);
             response.EnsureSuccessStatusCode();
 
             await batchTracker.UpdateBatchStatusAsync(batchId, BatchStatus.Processing);
 
-            logger.LogInformation("[SFTP] Batch {batchId} submitted — {count} payments.",
+            logger.LogInformation("[Batch] Batch {batchId} submitted — {count} payments.",
                 batchId, queuedPayments.Count);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "[SFTP] Batch {batchId} — failed to submit.", batchId);
+            logger.LogError(ex, "[Batch] Batch {batchId} — failed to submit.", batchId);
             await batchTracker.UpdateBatchStatusAsync(batchId, BatchStatus.Error);
         }
 
@@ -209,7 +209,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "[SFTP] Failed to get batch status for {batchId}.", batchId);
+            logger.LogError(ex, "[Batch] Failed to get batch status for {batchId}.", batchId);
             var error = req.CreateResponse(HttpStatusCode.InternalServerError);
             await error.WriteStringAsync("Failed to retrieve batch status.");
             return error;
@@ -227,7 +227,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
         try
         {
             int count = await batchTracker.ClearAllAsync();
-            logger.LogInformation("[SFTP] Cleared {count} entities from BatchTracking table.", count);
+            logger.LogInformation("[Batch] Cleared {count} entities from BatchTracking table.", count);
 
             var response = req.CreateResponse(HttpStatusCode.OK);
             await response.WriteAsJsonAsync(new { deleted = count });
@@ -235,7 +235,7 @@ public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracke
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "[SFTP] Failed to clear batch data.");
+            logger.LogError(ex, "[Batch] Failed to clear batch data.");
             var error = req.CreateResponse(HttpStatusCode.InternalServerError);
             await error.WriteStringAsync("Failed to clear batch data.");
             return error;
