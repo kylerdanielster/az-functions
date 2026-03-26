@@ -11,7 +11,7 @@ C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP. Names
 Two-app architecture for batch payment processing using HTTP + Storage Queue + callbacks:
 
 **App 1: Coordinator** (`BatchCoordinator.cs`)
-1. `RunDataFeed` (Timer) / `TriggerDataFeed` (HTTP) — generates 10 fake ACH payments via Bogus, creates batch + 10 payment entities in Table Storage (all fields stored), queries back Queued payments, POSTs entire batch to App 2 in one request, sets `Processing` status on successful submit
+1. `RunDataFeed` (Timer) / `TriggerDataFeed` (HTTP) — generates 10 fake ACH payments via Bogus, creates batch + 10 payment entities in Table Storage (all fields stored), queries all Queued payments from Table Storage (picks up orphans from prior failed runs), POSTs entire batch to App 2 in one request, sets `Processing` status on successful submit
 2. `BatchCompleted` (HTTP callback) — receives `BatchCallback(BatchId, Status)` callbacks at each stage, calls `UpdateBatchStatusAsync`. Logs warning on Error (TODO: send alert email), logs info on Processed (TODO: notify third party)
 3. `GetBatchStatus` (HTTP GET) — returns batch + payment statuses from Table Storage
 4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)

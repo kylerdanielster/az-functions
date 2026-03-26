@@ -74,7 +74,7 @@ Step 1: App 1 submits a batch to App 2 (BatchCoordinator.cs)
   RunDataFeed (Timer, daily) / TriggerDataFeed (HTTP POST /api/datafeed/trigger)
     1. Generate 10 fake ACH payments (Bogus)
     2. Create batch + 10 payment entities in Table Storage via IBatchTracker (BatchTracking.cs)
-    3. Query back Queued payments
+    3. Query all Queued payments for the batch from Table Storage (picks up orphaned payments from a prior failed run)
     4. POST entire batch to ReceiveBatchRequest (BatchProcessor.cs)
     5. On success, set batch status to Processing
 
@@ -474,7 +474,7 @@ The `BatchCoordinator` class (`BatchCoordinator.cs`) acts as the coordinator. It
 
 1. Generates 10 random ACH payments using Bogus (payor, payee, amount, account/routing numbers, date)
 2. Creates a batch entity and 10 payment entities in Table Storage via `IBatchTracker` (`BatchTracking.cs`)
-3. Queries back only Queued payments via `IBatchTracker.GetQueuedPaymentsAsync`
+3. Queries all Queued payments for the batch from Table Storage via `IBatchTracker.GetQueuedPaymentsAsync` (picks up orphaned payments from a prior failed run)
 4. POSTs the entire batch as a `BatchRequest` to `ReceiveBatchRequest` (`BatchProcessor.cs`) at `POST /api/batch/process`
 5. On successful submission, sets batch status to Processing via `IBatchTracker.UpdateBatchStatusAsync`
 6. On submission failure, sets batch status to Error
