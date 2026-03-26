@@ -9,7 +9,7 @@ These rules apply when working with test files and scripts.
 
 ## End-to-End Testing
 
-The primary test mechanism is `test-sftp-orchestration.sh`.
+The primary test mechanism is `test-batch-orchestration.sh`.
 
 ### Prerequisites
 
@@ -19,14 +19,14 @@ The primary test mechanism is `test-sftp-orchestration.sh`.
 ### Running Tests
 
 ```bash
-./test-sftp-orchestration.sh
+./test-batch-orchestration.sh
 ```
 
 The script:
 1. Cleans up previous test data (batch tracking + SFTP files)
 2. Triggers a batch of 10 items via `POST /api/datafeed/trigger`
 3. Polls batch status until all items complete
-4. Verifies 20 SFTP files uploaded (10 person + 10 address)
+4. Verifies 2 SFTP files uploaded (1 payment CSV + 1 GL CSV)
 
 > **Note:** `test-sftp-retry.sh` is stale — it references endpoints and tools from a previous architecture revision and will not work.
 

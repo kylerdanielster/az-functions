@@ -10,16 +10,16 @@ C# on .NET 10. Azure Functions v4 isolated worker model. SSH.NET for SFTP. Names
 
 Two-app architecture for batch payment processing using HTTP + Storage Queue + callbacks:
 
-**App 1: Coordinator** (`SftpDataFeed.cs`)
+**App 1: Coordinator** (`BatchCoordinator.cs`)
 1. `RunDataFeed` (Timer) / `TriggerDataFeed` (HTTP) — generates 10 fake ACH payments via Bogus, creates batch + 10 payment entities in Table Storage (all fields stored), queries back Queued payments, POSTs entire batch to App 2 in one request, sets `Processing` status on successful submit
-2. `BatchCompleted` (HTTP callback) — receives `SftpBatchCallback(BatchId, Status)` callbacks at each stage, calls `UpdateBatchStatusAsync`. Logs warning on Error (TODO: send alert email), logs info on Processed (TODO: notify third party)
+2. `BatchCompleted` (HTTP callback) — receives `BatchCallback(BatchId, Status)` callbacks at each stage, calls `UpdateBatchStatusAsync`. Logs warning on Error (TODO: send alert email), logs info on Processed (TODO: notify third party)
 3. `GetBatchStatus` (HTTP GET) — returns batch + payment statuses from Table Storage
 4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)
 
-**App 2: SFTP Processor** (`SftpProcessor.cs` + `SftpOrchestration.cs`)
-1. `ReceiveSftpRequest` (HTTP) — validates `SftpBatchRequest` (BatchId, Payments, CallbackUrl), drops onto Storage Queue via `IMessageQueue`, returns 202
-2. `ProcessSftpQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`sftp-{batchId}`)
-3. `SftpOrchestration` (Orchestrator) — processes files **sequentially**: payment file first, then GL only if payment succeeds. Callbacks for terminal states only:
+**App 2: Batch Processor** (`BatchProcessor.cs` + `BatchOrchestration.cs`)
+1. `ReceiveBatchRequest` (HTTP) — validates `BatchRequest` (BatchId, Payments, CallbackUrl), drops onto Storage Queue via `IMessageQueue`, returns 202
+2. `ProcessBatchQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`batch-{batchId}`)
+3. `BatchOrchestration` (Orchestrator) — processes files **sequentially**: payment file first, then GL only if payment succeeds. Callbacks for terminal states only:
    - Payment SFTP fails → callback `Error`, return early (no GL attempt)
    - GL SFTP succeeds → callback `Processed`
    - GL SFTP fails → queue to `gl-error-queue`, NO callback (App 1 stays in `Processing`)
@@ -29,7 +29,7 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 
 **Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Two entity levels: batch (PK: "batch", RK: batchId) and payment (PK: batchId, RK: paymentId, EntityType: "payment"). Each batch has 10 payment entities (pmt-000 through pmt-009) with all PaymentData fields stored. `UpdateBatchStatusAsync` handles status transitions — when terminal (Processed/Error), sets `CompletedAt` and bulk-updates all payment entities. Idempotent: skips if already terminal. Entity creation is idempotent (409 Conflict ignored). Batch statuses: `Queued`, `Processing`, `Processed`, `Error`.
 
-**Storage**: All services use the `AzureWebJobsStorage` connection string. Locally → Azurite. In production: App 1 uses a dedicated storage account for Table Storage (batch/payment tracking); App 2 uses the function app's built-in storage account for its queues (`sftp-processing-queue`, `gl-error-queue`) and Durable Functions state.
+**Storage**: All services use the `AzureWebJobsStorage` connection string. Locally → Azurite. In production: App 1 uses a dedicated storage account for Table Storage (batch/payment tracking); App 2 uses the function app's built-in storage account for its queues (`batch-processing-queue`, `gl-error-queue`) and Durable Functions state.
 
 **SFTP**: SSH.NET (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory`. Connections are async (`ConnectAsync`). Each activity creates a new connection — pooling is not feasible across Durable Functions activities. Local server via OpenSSH Docker container (port 2222).
 
@@ -40,12 +40,13 @@ Models.cs                     Shared records, DTOs, and BatchStatus constants
 BatchTracking.cs              IBatchTracker interface + TableBatchTracker implementation
 SftpClientFactory.cs          ISftpClientFactory interface + SftpClientFactory implementation
 MessageQueue.cs               IMessageQueue + IGLErrorQueue interfaces + implementations
-SftpProcessor.cs              HTTP receiver + queue triggers (App 2 entry points)
-SftpOrchestration.cs          Orchestrator, file creation/upload activities, callback, GL error queue, SFTP endpoints
-SftpDataFeed.cs               Timer/HTTP triggers, batch status, callback webhook (App 1)
+BatchProcessor.cs             HTTP receiver + queue triggers (App 2 entry points)
+BatchOrchestration.cs         Orchestrator, file creation/upload activities, callback, GL error queue
+SftpEndpoints.cs              SFTP test/debug endpoints (ListFiles, GetFile, DeleteAllFiles)
+BatchCoordinator.cs           Timer/HTTP triggers, batch status, callback webhook (App 1)
 host.json                     Azure Functions, durable task, and queue config
 docker-compose.yml            Azurite + SFTP containers for local dev
-test-sftp-orchestration.sh    E2E test script
+test-batch-orchestration.sh   E2E test script
 tests/AzFunctions.Tests/      xUnit + NSubstitute unit tests (see Testing section)
 ```
 
@@ -105,20 +106,20 @@ dotnet test tests/AzFunctions.Tests/ --collect:"XPlat Code Coverage"  # with cov
 ```
 
 Test files:
-- `ReceiveSftpRequestTests.cs` — input validation (null body, missing fields, empty payments, valid request, queue message content verification)
+- `ReceiveBatchRequestTests.cs` — input validation (null body, missing fields, empty payments, valid request, queue message content verification)
 - `BatchCompletedTests.cs` — callback handling (Processed, Error, Processing callbacks, null request)
 - `GenerateBatchTests.cs` — batch submission (submit succeeds with payment entity creation, submit fails marks batch Error)
-- `SftpOrchestrationTests.cs` — sequential flow (full success, payment failure stops GL, GL failure queues error, callback failure isolation, callback payload verification)
+- `BatchOrchestrationTests.cs` — sequential flow (full success, payment failure stops GL, GL failure queues error, callback failure isolation, callback payload verification)
 - `CreatePaymentFileTests.cs` — CSV generation (header, data formatting, escaping, empty list, amount formatting, sensitive field inclusion)
 - `CreateGLFileTests.cs` — GL CSV generation (header, sensitive field exclusion, escaping, amount formatting)
 - `GetBatchStatusTests.cs` — batch status endpoint (404 path, payment assembly/ordering, completed batch, error handling)
-- `ProcessSftpQueueTests.cs` — queue trigger (valid message, null/malformed input, orchestration ID format)
+- `ProcessBatchQueueTests.cs` — queue trigger (valid message, null/malformed input, orchestration ID format)
 - `ProcessGLErrorQueueTests.cs` — GL error queue trigger (valid message, null message, malformed input)
 - `Helpers/` — `FakeHttpRequestData`, `FakeHttpResponseData`, `FakeFunctionContext` for Azure Functions isolated worker model
 
 Tests mock `IBatchTracker`, `IMessageQueue`, `IGLErrorQueue`, `ISftpClientFactory`, and `IHttpClientFactory`. `TableBatchTracker` is tested via E2E against Azurite (not unit-tested — `TableClient` has no interface).
 
-**E2E tests**: `./test-sftp-orchestration.sh` (requires Docker services + `func start`).
+**E2E tests**: `./test-batch-orchestration.sh` (requires Docker services + `func start`).
 
 **Coverage**: Unit tests cover business logic callers (validation, error handling, callback processing). Infrastructure classes (`TableBatchTracker`, `SftpClientFactory`, `StorageQueueClient`, `GLErrorQueueClient`) are covered by E2E.
 
@@ -134,11 +135,11 @@ These load automatically based on context — no action needed:
 
 | Location | Description |
 |----------|-------------|
-| `SftpDataFeed.cs:45-52` | Callback failure resilience (Processed/Error only) — batch stuck in Processing if terminal callback fails all retries. Processing transition is handled locally. Needs reconciliation timer or timeout mechanism. |
-| `SftpDataFeed.cs:82-83` | Notify third party when batch processing completes (Processed callback). |
-| `SftpDataFeed.cs:87-88` | Send alert email when batch fails (Error callback). |
-| `SftpProcessor.cs:115` | Send error email notification for GL upload failures. |
-| `SftpProcessor.cs:116` | Implement manual retry endpoint for failed GL uploads. |
+| `BatchCoordinator.cs:45-52` | Callback failure resilience (Processed/Error only) — batch stuck in Processing if terminal callback fails all retries. Processing transition is handled locally. Needs reconciliation timer or timeout mechanism. |
+| `BatchCoordinator.cs:82-83` | Notify third party when batch processing completes (Processed callback). |
+| `BatchCoordinator.cs:87-88` | Send alert email when batch fails (Error callback). |
+| `BatchProcessor.cs:115` | Send error email notification for GL upload failures. |
+| `BatchProcessor.cs:116` | Implement manual retry endpoint for failed GL uploads. |
 
 ## Useful Resources
 
