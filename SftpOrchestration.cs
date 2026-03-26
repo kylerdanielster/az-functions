@@ -42,7 +42,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         ILogger logger = context.CreateReplaySafeLogger(nameof(SftpOrchestration));
         string id = context.InstanceId;
 
-        var request = context.GetInput<SftpBatchRequest>()
+        var request = context.GetInput<BatchRequest>()
             ?? throw new InvalidOperationException("Orchestration input is missing.");
 
         logger.LogInformation("[SFTP] Orchestration {id} started — batch {batchId}, {paymentCount} payments.",
@@ -68,7 +68,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
             try
             {
                 await context.CallActivityAsync(nameof(SendCallback),
-                    new SendCallbackInput(request.CallbackUrl, new SftpBatchCallback(request.BatchId, BatchStatus.Error)),
+                    new SendCallbackInput(request.CallbackUrl, new BatchCallback(request.BatchId, BatchStatus.Error)),
                     CallbackRetryOptions);
             }
             catch (TaskFailedException cbEx)
@@ -115,7 +115,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
         try
         {
             await context.CallActivityAsync(nameof(SendCallback),
-                new SendCallbackInput(request.CallbackUrl, new SftpBatchCallback(request.BatchId, BatchStatus.Processed)),
+                new SendCallbackInput(request.CallbackUrl, new BatchCallback(request.BatchId, BatchStatus.Processed)),
                 CallbackRetryOptions);
         }
         catch (TaskFailedException ex)
@@ -132,7 +132,7 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     public record CreatePaymentFileInput(string BatchId, List<PaymentData> Payments);
     public record CreateGLFileInput(string BatchId, List<PaymentData> Payments);
     public record UploadFileInput(string FileName, string Content);
-    public record SendCallbackInput(string CallbackUrl, SftpBatchCallback Callback);
+    public record SendCallbackInput(string CallbackUrl, BatchCallback Callback);
     public record GLErrorMessage(string BatchId, List<PaymentData> Payments, string CallbackUrl, string ErrorMessage);
 
     // --- Activities ---

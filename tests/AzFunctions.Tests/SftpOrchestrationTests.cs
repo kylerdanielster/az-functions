@@ -20,7 +20,7 @@ public class SftpOrchestrationTests
         var context = Substitute.For<TaskOrchestrationContext>();
         context.InstanceId.Returns("sftp-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
-        context.GetInput<SftpBatchRequest>().Returns(new SftpBatchRequest(
+        context.GetInput<BatchRequest>().Returns(new BatchRequest(
             "batch1", CreateTestPayments(), "http://localhost/callback"));
         return context;
     }

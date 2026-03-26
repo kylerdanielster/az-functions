@@ -15,7 +15,7 @@ public class BatchCompletedTests
     [Fact]
     public async Task ProcessedCallback_UpdatesBatchStatus()
     {
-        var callback = new SftpBatchCallback("batch1", BatchStatus.Processed);
+        var callback = new BatchCallback("batch1", BatchStatus.Processed);
         var req = FakeHttpRequestData.CreateWithJson(context, callback);
 
         var response = await CreateDataFeed().BatchCompleted(req, context);
@@ -37,7 +37,7 @@ public class BatchCompletedTests
     [Fact]
     public async Task ErrorCallback_UpdatesBatchStatus()
     {
-        var callback = new SftpBatchCallback("batch1", BatchStatus.Error);
+        var callback = new BatchCallback("batch1", BatchStatus.Error);
         var req = FakeHttpRequestData.CreateWithJson(context, callback);
 
         var response = await CreateDataFeed().BatchCompleted(req, context);
@@ -49,7 +49,7 @@ public class BatchCompletedTests
     [Fact]
     public async Task ProcessingCallback_UpdatesBatchStatus()
     {
-        var callback = new SftpBatchCallback("batch1", BatchStatus.Processing);
+        var callback = new BatchCallback("batch1", BatchStatus.Processing);
         var req = FakeHttpRequestData.CreateWithJson(context, callback);
 
         var response = await CreateDataFeed().BatchCompleted(req, context);

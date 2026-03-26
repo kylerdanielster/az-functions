@@ -64,7 +64,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
     {
         ILogger logger = executionContext.GetLogger(nameof(BatchCompleted));
 
-        var callback = await req.ReadFromJsonAsync<SftpBatchCallback>();
+        var callback = await req.ReadFromJsonAsync<BatchCallback>();
         if (callback is null)
         {
             var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
@@ -128,7 +128,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         }
 
         var queuedPayments = await batchTracker.GetQueuedPaymentsAsync(batchId);
-        var request = new SftpBatchRequest(batchId, queuedPayments, callbackUrl);
+        var request = new BatchRequest(batchId, queuedPayments, callbackUrl);
 
         using var httpClient = httpClientFactory.CreateClient();
         try

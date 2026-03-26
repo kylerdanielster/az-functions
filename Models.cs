@@ -8,13 +8,13 @@ public record PaymentData(string PaymentId, string PayorName, string PayeeName,
 /// Request payload sent from the Coordinator (App 1) to the SFTP Processor (App 2).
 /// Contains all payments and the callback URL for completion notification.
 /// </summary>
-public record SftpBatchRequest(string BatchId, List<PaymentData> Payments, string CallbackUrl);
+public record BatchRequest(string BatchId, List<PaymentData> Payments, string CallbackUrl);
 
 /// <summary>
 /// Callback payload sent from the SFTP Processor (App 2) back to the Coordinator (App 1)
 /// with the current batch status.
 /// </summary>
-public record SftpBatchCallback(string BatchId, string Status);
+public record BatchCallback(string BatchId, string Status);
 
 /// <summary>String constants for batch status values stored in Table Storage.</summary>
 public static class BatchStatus

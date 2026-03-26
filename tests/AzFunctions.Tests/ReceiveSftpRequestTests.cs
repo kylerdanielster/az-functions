@@ -15,7 +15,7 @@ public class ReceiveSftpRequestTests
     [Fact]
     public async Task ValidRequest_Returns202AndQueuesMessage()
     {
-        var body = new SftpBatchRequest("batch1", [
+        var body = new BatchRequest("batch1", [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ], "http://localhost/callback");
@@ -33,7 +33,7 @@ public class ReceiveSftpRequestTests
     [Fact]
     public async Task ValidRequest_QueueMessageContainsAllPaymentFields()
     {
-        var body = new SftpBatchRequest("batch1", [
+        var body = new BatchRequest("batch1", [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ], "http://localhost/callback");
@@ -45,7 +45,7 @@ public class ReceiveSftpRequestTests
         await CreateProcessor().ReceiveSftpRequest(req, context);
 
         Assert.NotNull(capturedMessage);
-        var deserialized = JsonSerializer.Deserialize<SftpBatchRequest>(capturedMessage,
+        var deserialized = JsonSerializer.Deserialize<BatchRequest>(capturedMessage,
             new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
         Assert.NotNull(deserialized);
         Assert.Equal("batch1", deserialized.BatchId);
@@ -69,7 +69,7 @@ public class ReceiveSftpRequestTests
     [Fact]
     public async Task MissingBatchId_Returns400()
     {
-        var body = new SftpBatchRequest("", [
+        var body = new BatchRequest("", [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ], "http://localhost/callback");
@@ -84,7 +84,7 @@ public class ReceiveSftpRequestTests
     [Fact]
     public async Task EmptyPayments_Returns400()
     {
-        var body = new SftpBatchRequest("batch1", [], "http://localhost/callback");
+        var body = new BatchRequest("batch1", [], "http://localhost/callback");
         var req = FakeHttpRequestData.CreateWithJson(context, body);
 
         var response = await CreateProcessor().ReceiveSftpRequest(req, context);

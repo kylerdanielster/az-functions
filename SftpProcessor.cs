@@ -36,7 +36,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
     {
         ILogger logger = executionContext.GetLogger(nameof(ReceiveSftpRequest));
 
-        var request = await req.ReadFromJsonAsync<SftpBatchRequest>();
+        var request = await req.ReadFromJsonAsync<BatchRequest>();
         if (request is null)
         {
             var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
@@ -77,7 +77,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
     {
         ILogger logger = executionContext.GetLogger(nameof(ProcessSftpQueue));
 
-        var request = JsonSerializer.Deserialize<SftpBatchRequest>(messageText, JsonOptions)
+        var request = JsonSerializer.Deserialize<BatchRequest>(messageText, JsonOptions)
             ?? throw new InvalidOperationException("Failed to deserialize queue message.");
 
         string instanceId = $"sftp-{request.BatchId}";

@@ -19,7 +19,7 @@ public class ProcessSftpQueueTests
     [Fact]
     public async Task ValidMessage_StartsOrchestrationWithDeterministicId()
     {
-        var request = new SftpBatchRequest("batch1",
+        var request = new BatchRequest("batch1",
         [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
@@ -31,7 +31,7 @@ public class ProcessSftpQueueTests
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
             nameof(SftpOrchestration),
-            Arg.Any<SftpBatchRequest>(),
+            Arg.Any<BatchRequest>(),
             Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "sftp-batch1"));
     }
 
@@ -56,7 +56,7 @@ public class ProcessSftpQueueTests
     [Fact]
     public async Task InstanceId_IncludesBatchId()
     {
-        var request = new SftpBatchRequest("abc123",
+        var request = new BatchRequest("abc123",
         [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
@@ -68,7 +68,7 @@ public class ProcessSftpQueueTests
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
             nameof(SftpOrchestration),
-            Arg.Any<SftpBatchRequest>(),
+            Arg.Any<BatchRequest>(),
             Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "sftp-abc123"));
     }
 }
