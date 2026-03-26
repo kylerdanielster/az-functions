@@ -13,7 +13,7 @@ namespace AzFunctions;
 /// queues them via <see cref="IMessageQueue"/> for reliable delivery, and starts Durable Functions orchestrations.
 /// Also processes GL error queue messages for failed GL uploads.
 /// </summary>
-public class SftpProcessor(IMessageQueue messageQueue)
+public class BatchProcessor(IMessageQueue messageQueue)
 {
     public const string QueueName = "sftp-processing-queue";
     public const string GLErrorQueueName = "gl-error-queue";
@@ -66,7 +66,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
     }
 
     /// <summary>
-    /// Queue trigger that deserializes a batch processing request and starts an SftpOrchestration
+    /// Queue trigger that deserializes a batch processing request and starts an BatchOrchestration
     /// with a deterministic instance ID (sftp-{batchId}) to prevent duplicates.
     /// </summary>
     [Function(nameof(ProcessSftpQueue))]
@@ -86,7 +86,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
             instanceId, request.BatchId, request.Payments.Count);
 
         await durableClient.ScheduleNewOrchestrationInstanceAsync(
-            nameof(SftpOrchestration),
+            nameof(BatchOrchestration),
             request,
             new StartOrchestrationOptions { InstanceId = instanceId });
     }
@@ -102,7 +102,7 @@ public class SftpProcessor(IMessageQueue messageQueue)
     {
         ILogger logger = executionContext.GetLogger(nameof(ProcessGLErrorQueue));
 
-        var errorMessage = JsonSerializer.Deserialize<SftpOrchestration.GLErrorMessage>(messageText, JsonOptions);
+        var errorMessage = JsonSerializer.Deserialize<BatchOrchestration.GLErrorMessage>(messageText, JsonOptions);
         if (errorMessage is null)
         {
             logger.LogError("[SFTP] Failed to deserialize GL error queue message.");

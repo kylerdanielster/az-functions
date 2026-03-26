@@ -8,7 +8,7 @@ public class GenerateBatchTests : IDisposable
 {
     private readonly IBatchTracker batchTracker = Substitute.For<IBatchTracker>();
     private readonly IHttpClientFactory httpClientFactory = Substitute.For<IHttpClientFactory>();
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpDataFeed.TriggerDataFeed));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchCoordinator.TriggerDataFeed));
 
     private readonly string? originalProcessorUrl;
     private readonly string? originalCoordinatorUrl;
@@ -27,7 +27,7 @@ public class GenerateBatchTests : IDisposable
         Environment.SetEnvironmentVariable("COORDINATOR_BASE_URL", originalCoordinatorUrl);
     }
 
-    private SftpDataFeed CreateDataFeed() => new(httpClientFactory, batchTracker);
+    private BatchCoordinator CreateDataFeed() => new(httpClientFactory, batchTracker);
 
     private static List<PaymentData> CreateTestPayments(int count = 10) =>
         Enumerable.Range(0, count).Select(i =>

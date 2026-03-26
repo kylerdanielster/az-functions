@@ -4,18 +4,18 @@ namespace AzFunctions.Tests;
 
 public class CreatePaymentFileTests
 {
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpOrchestration.CreatePaymentFile));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchOrchestration.CreatePaymentFile));
 
     [Fact]
     public void SinglePayment_ProducesCorrectCsv()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         var lines = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(2, lines.Length);
@@ -26,13 +26,13 @@ public class CreatePaymentFileTests
     [Fact]
     public void MultiplePayments_ProducesOneRowPerPayment()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15"),
             new PaymentData("pmt-001", "Jane Smith", "Globex Inc", 2750.50m, "9876543210", "021000089", "2026-03-14")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         var lines = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(3, lines.Length); // header + 2 data rows
@@ -41,9 +41,9 @@ public class CreatePaymentFileTests
     [Fact]
     public void EmptyPayments_ProducesHeaderOnly()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1", []);
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1", []);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         var lines = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Single(lines);
@@ -53,13 +53,13 @@ public class CreatePaymentFileTests
     [Fact]
     public void IncludesAccountAndRoutingNumbers()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
                 "SENSITIVE_ACCT", "SENSITIVE_RTN", "2026-03-15")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         Assert.Contains("SENSITIVE_ACCT", csv);
         Assert.Contains("SENSITIVE_RTN", csv);
@@ -68,13 +68,13 @@ public class CreatePaymentFileTests
     [Fact]
     public void FieldWithComma_IsQuoted()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "Doe, John", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         Assert.Contains("\"Doe, John\"", csv);
     }
@@ -82,13 +82,13 @@ public class CreatePaymentFileTests
     [Fact]
     public void FieldWithDoubleQuotes_IsEscaped()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "John \"JD\" Doe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         Assert.Contains("\"John \"\"JD\"\" Doe\"", csv);
     }
@@ -96,13 +96,13 @@ public class CreatePaymentFileTests
     [Fact]
     public void FieldWithNewline_IsQuoted()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "John\nDoe", "Acme Corp", 1500.00m,
                 "1234567890", "021000021", "2026-03-15")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         Assert.Contains("\"John\nDoe\"", csv);
     }
@@ -110,13 +110,13 @@ public class CreatePaymentFileTests
     [Fact]
     public void AmountFormatted_TwoDecimalPlaces()
     {
-        var input = new SftpOrchestration.CreatePaymentFileInput("batch1",
+        var input = new BatchOrchestration.CreatePaymentFileInput("batch1",
         [
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500m,
                 "1234567890", "021000021", "2026-03-15")
         ]);
 
-        string csv = SftpOrchestration.CreatePaymentFile(input, context);
+        string csv = BatchOrchestration.CreatePaymentFile(input, context);
 
         Assert.Contains("1500.00", csv);
     }

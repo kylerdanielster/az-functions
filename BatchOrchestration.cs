@@ -13,7 +13,7 @@ namespace AzFunctions;
 /// GL failures are queued to the GL error queue for manual retry — no callback is sent,
 /// so App 1 stays in Processing until the GL is retried and succeeds.
 /// </summary>
-public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory, IGLErrorQueue glErrorQueue)
+public class BatchOrchestration(IHttpClientFactory httpClientFactory, ISftpClientFactory sftpClientFactory, IGLErrorQueue glErrorQueue)
 {
     private static readonly TaskOptions UploadRetryOptions = TaskOptions.FromRetryPolicy(new RetryPolicy(
         maxNumberOfAttempts: 3,
@@ -35,11 +35,11 @@ public class SftpOrchestration(IHttpClientFactory httpClientFactory, ISftpClient
     /// If GL fails → queue to GL error queue, no callback (App 1 stays in Processing).
     /// Note: Processing status is set by App 1 after successful submission — no callback needed.
     /// </summary>
-    [Function(nameof(SftpOrchestration))]
+    [Function(nameof(BatchOrchestration))]
     public static async Task<string> RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context)
     {
-        ILogger logger = context.CreateReplaySafeLogger(nameof(SftpOrchestration));
+        ILogger logger = context.CreateReplaySafeLogger(nameof(BatchOrchestration));
         string id = context.InstanceId;
 
         var request = context.GetInput<BatchRequest>()

@@ -5,12 +5,12 @@ using NSubstitute;
 
 namespace AzFunctions.Tests;
 
-public class ReceiveSftpRequestTests
+public class ReceiveBatchRequestTests
 {
     private readonly IMessageQueue messageQueue = Substitute.For<IMessageQueue>();
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpProcessor.ReceiveSftpRequest));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ReceiveSftpRequest));
 
-    private SftpProcessor CreateProcessor() => new(messageQueue);
+    private BatchProcessor CreateProcessor() => new(messageQueue);
 
     [Fact]
     public async Task ValidRequest_Returns202AndQueuesMessage()

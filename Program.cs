@@ -30,7 +30,7 @@ builder.Services.AddSingleton<IMessageQueue>(sp =>
 {
     string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
         ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
-    var queueClient = new QueueClient(connectionString, SftpProcessor.QueueName, new QueueClientOptions
+    var queueClient = new QueueClient(connectionString, BatchProcessor.QueueName, new QueueClientOptions
     {
         MessageEncoding = QueueMessageEncoding.Base64
     });
@@ -42,7 +42,7 @@ builder.Services.AddSingleton<IGLErrorQueue>(sp =>
 {
     string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
         ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
-    var queueClient = new QueueClient(connectionString, SftpProcessor.GLErrorQueueName, new QueueClientOptions
+    var queueClient = new QueueClient(connectionString, BatchProcessor.GLErrorQueueName, new QueueClientOptions
     {
         MessageEncoding = QueueMessageEncoding.Base64
     });

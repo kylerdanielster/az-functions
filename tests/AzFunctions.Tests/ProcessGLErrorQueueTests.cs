@@ -10,12 +10,12 @@ public class ProcessGLErrorQueueTests
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpProcessor.ProcessGLErrorQueue));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ProcessGLErrorQueue));
 
     [Fact]
     public void ValidMessage_DoesNotThrow()
     {
-        var errorMessage = new SftpOrchestration.GLErrorMessage(
+        var errorMessage = new BatchOrchestration.GLErrorMessage(
             "batch1",
             [new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15")],
             "http://localhost/callback",
@@ -23,7 +23,7 @@ public class ProcessGLErrorQueueTests
 
         string messageText = JsonSerializer.Serialize(errorMessage, JsonOptions);
 
-        var exception = Record.Exception(() => SftpProcessor.ProcessGLErrorQueue(messageText, context));
+        var exception = Record.Exception(() => BatchProcessor.ProcessGLErrorQueue(messageText, context));
 
         Assert.Null(exception);
     }
@@ -34,7 +34,7 @@ public class ProcessGLErrorQueueTests
         // Deserializes to null — method handles gracefully by logging and returning
         string messageText = "null";
 
-        var exception = Record.Exception(() => SftpProcessor.ProcessGLErrorQueue(messageText, context));
+        var exception = Record.Exception(() => BatchProcessor.ProcessGLErrorQueue(messageText, context));
 
         Assert.Null(exception);
     }
@@ -46,7 +46,7 @@ public class ProcessGLErrorQueueTests
         // But with strict JSON, it may throw — the method should handle either case
         string messageText = "{}";
 
-        var exception = Record.Exception(() => SftpProcessor.ProcessGLErrorQueue(messageText, context));
+        var exception = Record.Exception(() => BatchProcessor.ProcessGLErrorQueue(messageText, context));
 
         Assert.Null(exception);
     }

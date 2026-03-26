@@ -68,43 +68,43 @@ In production, this will be two separate function apps. They are combined into a
 Communication between the two apps is HTTP + callback. App 1 POSTs the entire batch to App 2 in a single request and receives a status callback when processing completes or fails.
 
 ```
-Step 1: App 1 submits a batch to App 2
-───────────────────────────────────────
+Step 1: App 1 submits a batch to App 2 (SftpDataFeed.cs)
+─────────────────────────────────────────────────────────
 
-  RunDataFeed (Timer, daily) / TriggerDataFeed (HTTP)
+  RunDataFeed (Timer, daily) / TriggerDataFeed (HTTP POST /api/datafeed/trigger)
     1. Generate 10 fake ACH payments (Bogus)
-    2. Create batch entity + 10 payment entities in Table Storage
+    2. Create batch + 10 payment entities in Table Storage via IBatchTracker (BatchTracking.cs)
     3. Query back Queued payments
-    4. POST entire batch to ReceiveSftpRequest
+    4. POST entire batch to ReceiveSftpRequest (SftpProcessor.cs)
     5. On success, set batch status to Processing
 
-Step 2: App 2 processes the batch
-─────────────────────────────────
+Step 2: App 2 processes the batch (SftpProcessor.cs → SftpOrchestration.cs)
+────────────────────────────────────────────────────────────────────────────
 
-  ReceiveSftpRequest (HTTP POST /api/sftp/process)
-    1. Validate request (BatchId, CallbackUrl, Payments)
-    2. Drop message onto Storage Queue
+  ReceiveSftpRequest (HTTP POST /api/sftp/process) — SftpProcessor.cs
+    1. Validate SftpBatchRequest (BatchId, CallbackUrl, Payments)
+    2. Drop message onto sftp-processing-queue via IMessageQueue (MessageQueue.cs)
     3. Return 202 Accepted
 
-  ProcessSftpQueue (Queue Trigger)
-    1. Deserialize queue message
-    2. Start SftpOrchestration (deterministic ID: sftp-{batchId})
+  ProcessSftpQueue (Queue Trigger: sftp-processing-queue) — SftpProcessor.cs
+    1. Deserialize queue message into SftpBatchRequest
+    2. Start SftpOrchestration via DurableTaskClient (deterministic ID: sftp-{batchId})
 
-  SftpOrchestration (Durable Functions Orchestrator)
-    1. CreatePaymentFile — build payment CSV (all fields)
-    2. UploadFile — upload payment CSV to SFTP (with retry)
-       - If payment upload fails → callback Error, stop (no GL attempt)
-    3. CreateGLFile — build GL CSV (excludes sensitive banking fields)
-    4. UploadFile — upload GL CSV to SFTP (with retry)
-       - If GL upload fails → queue to gl-error-queue, no callback
-    5. If both succeed → callback Processed
+  SftpOrchestration (Durable Functions Orchestrator) — SftpOrchestration.cs
+    1. CreatePaymentFile activity — build payment CSV (all fields)
+    2. UploadFile activity — upload payment CSV to SFTP (with retry)
+       - If UploadFile fails → SendCallback activity (Error), stop (no GL attempt)
+    3. CreateGLFile activity — build GL CSV (excludes sensitive banking fields)
+    4. UploadFile activity — upload GL CSV to SFTP (with retry)
+       - If UploadFile fails → SendToGLErrorQueue activity, no callback
+    5. If both succeed → SendCallback activity (Processed)
 
-Step 3: App 1 receives callbacks
-────────────────────────────────
+Step 3: App 1 receives callbacks (SftpDataFeed.cs)
+───────────────────────────────────────────────────
 
-  BatchCompleted (HTTP POST /api/batch/callback)
+  BatchCompleted (HTTP POST /api/batch/callback) — SftpDataFeed.cs
     1. Receive SftpBatchCallback (BatchId, Status)
-    2. Update batch status in Table Storage
+    2. Update batch status in Table Storage via IBatchTracker (BatchTracking.cs)
     3. Processed → log (TODO: notify third party)
     4. Error → log warning (TODO: send alert email)
 ```
@@ -120,13 +120,13 @@ Queued → Error                    (batch submission failure)
 
 ### Key design decisions
 
-- **Batch-level processing**: App 1 sends all 10 payments in a single request. App 2 creates one payment CSV and one GL CSV for the entire batch.
-- **Sequential file processing**: Payment file uploads first. GL file is only attempted if the payment file succeeds.
-- **Deterministic instance IDs**: `sftp-{batchId}` prevents duplicate orchestrations from at-least-once queue delivery.
-- **GL failure isolation**: GL upload failure queues to `gl-error-queue` without sending a callback — App 1 stays in `Processing` until manual retry succeeds.
-- **Storage Queue decoupling**: Separates HTTP acceptance (fast 202) from orchestration processing. Built-in retry with poison queue support.
-- **Callback-driven status**: App 2 only calls back for terminal states (Processed, Error). The Processing transition is set locally by App 1 after successful submission.
-- **Idempotent status updates**: `UpdateBatchStatusAsync` skips updates if the batch is already in a terminal state. Entity creation ignores 409 Conflict.
+- **Batch-level processing**: `RunDataFeed` (`SftpDataFeed.cs`) sends all 10 payments in a single request. `SftpOrchestration` (`SftpOrchestration.cs`) creates one payment CSV and one GL CSV for the entire batch.
+- **Sequential file processing**: `UploadFile` uploads the payment file first. The `CreateGLFile` activity is only called if the payment `UploadFile` succeeds.
+- **Deterministic instance IDs**: `ProcessSftpQueue` (`SftpProcessor.cs`) sets the instance ID to `sftp-{batchId}`, preventing duplicate orchestrations from at-least-once queue delivery.
+- **GL failure isolation**: When GL `UploadFile` fails, `SendToGLErrorQueue` (`SftpOrchestration.cs`) queues to `gl-error-queue` without sending a callback — App 1 stays in `Processing` until manual retry succeeds.
+- **Storage Queue decoupling**: `ReceiveSftpRequest` (`SftpProcessor.cs`) returns 202 immediately and drops the message onto `sftp-processing-queue` via `IMessageQueue` (`MessageQueue.cs`). Built-in retry with poison queue support.
+- **Callback-driven status**: `SendCallback` (`SftpOrchestration.cs`) only calls back for terminal states (Processed, Error). The Processing transition is set locally by `RunDataFeed` (`SftpDataFeed.cs`) after successful submission.
+- **Idempotent status updates**: `UpdateBatchStatusAsync` in `TableBatchTracker` (`BatchTracking.cs`) skips updates if the batch is already in a terminal state. Entity creation ignores 409 Conflict.
 
 ### Data model (Table Storage)
 
@@ -149,11 +149,11 @@ The orchestration in `SftpOrchestration.cs` uses Azure Durable Functions, which 
 
 ### The 202 Accepted is your code, not the framework
 
-The Durable Functions framework does not automatically intercept HTTP requests. In this project, `ReceiveSftpRequest` is a regular HTTP-triggered function that validates the request, queues a message, and explicitly returns 202. The orchestrator and activities don't return HTTP responses at all — they communicate through internal storage infrastructure.
+The Durable Functions framework does not automatically intercept HTTP requests. In this project, `ReceiveSftpRequest` (`SftpProcessor.cs`) is a regular HTTP-triggered function that validates the request, queues a message via `IMessageQueue` (`MessageQueue.cs`), and explicitly returns 202. The orchestrator (`SftpOrchestration` in `SftpOrchestration.cs`) and its activities don't return HTTP responses at all — they communicate through internal storage infrastructure.
 
 ### Starting an orchestration
 
-When `ProcessSftpQueue` calls `ScheduleNewOrchestrationInstanceAsync`, the Durable Task Framework:
+When `ProcessSftpQueue` (`SftpProcessor.cs`) calls `ScheduleNewOrchestrationInstanceAsync`, the Durable Task Framework:
 
 1. Writes an **ExecutionStarted** event to the **history table** in your storage account
 2. Enqueues a message onto an **internal control queue** (e.g., `<taskhub>-control-00`)
@@ -164,7 +164,7 @@ When `ProcessSftpQueue` calls `ScheduleNewOrchestrationInstanceAsync`, the Durab
 The Durable Task Framework runs a **dispatcher** as a background service inside the function app host. It:
 
 - **Polls internal control queues** continuously
-- When it dequeues a message, it **replays** the orchestrator function (`RunOrchestrator`) from the beginning
+- When it dequeues a message, it **replays** the orchestrator function (`SftpOrchestration.RunOrchestrator` in `SftpOrchestration.cs`) from the beginning
 - Each `CallActivityAsync` is checked against the **history table**:
   - Result already in history → return cached result (replay, no execution)
   - Not in history → enqueue a **work item** to the internal work-item queue, then **suspend** the orchestrator
@@ -187,7 +187,7 @@ All of these are created automatically in your `AzureWebJobsStorage` account:
 This is why orchestrator functions must be **deterministic** (no `DateTime.Now`, no random values, no direct I/O):
 
 ```
-ProcessSftpQueue
+ProcessSftpQueue (SftpProcessor.cs)
     │
     ▼ ScheduleNewOrchestrationInstanceAsync()
     │
@@ -198,7 +198,7 @@ ProcessSftpQueue
     [Dispatcher — invisible background loop]
               │
               ├── dequeues control message
-              ├── replays RunOrchestrator from the top
+              ├── replays SftpOrchestration.RunOrchestrator (SftpOrchestration.cs)
               ├── hits CallActivityAsync → checks history
               │       │
               │       ├── cached? → return result, continue
@@ -206,6 +206,7 @@ ProcessSftpQueue
               │                              │
               │                              ▼
               │                    [Activity runs as separate function invocation]
+              │                    e.g. CreatePaymentFile, UploadFile (SftpOrchestration.cs)
               │                              │
               │                              └── writes result to History table
               │                                   enqueues control message
@@ -214,10 +215,10 @@ ProcessSftpQueue
                         (loop until orchestrator completes)
 ```
 
-For example, when the orchestrator hits `CallActivityAsync(nameof(CreatePaymentFile), ...)`:
+For example, when `SftpOrchestration.RunOrchestrator` (`SftpOrchestration.cs`) hits `CallActivityAsync(nameof(CreatePaymentFile), ...)`:
 
-- **First execution**: No history exists for this call → framework enqueues a work-item → orchestrator suspends → `CreatePaymentFile` runs as a separate function invocation → result saved to history → control queue message wakes the orchestrator
-- **Replay**: History has the result → `CallActivityAsync` returns the cached result immediately → orchestrator continues to the next call
+- **First execution**: No history exists for this call → framework enqueues a work-item → orchestrator suspends → `CreatePaymentFile` (`SftpOrchestration.cs`) runs as a separate function invocation → result saved to history → control queue message wakes the orchestrator
+- **Replay**: History has the result → `CallActivityAsync` returns the cached result immediately → orchestrator continues to the next `CallActivityAsync` (e.g., `UploadFile`)
 
 The orchestrator replays from the top every time it wakes up. Each completed activity is replayed from cache until the orchestrator reaches the next unfinished step.
 
@@ -270,7 +271,7 @@ The Durable Task Framework provides **at-least-once execution** guarantees. Beca
 
 ### Persisted orchestration data
 
-The original input passed to `ScheduleNewOrchestrationInstanceAsync` is stored in the `Instances` table as `SerializedInput`. This means the full `SftpBatchRequest` — batch ID, all 10 payments, and the callback URL — is persisted for the lifetime of the orchestration instance.
+The original input passed to `ScheduleNewOrchestrationInstanceAsync` (called by `ProcessSftpQueue` in `SftpProcessor.cs`) is stored in the `Instances` table as `SerializedInput`. This means the full `SftpBatchRequest` (`Models.cs`) — batch ID, all 10 payments, and the callback URL — is persisted for the lifetime of the orchestration instance.
 
 You can retrieve it programmatically:
 
@@ -426,26 +427,41 @@ The POC uses a single `AzureWebJobsStorage` connection string for simplicity. In
 
 ## Functions
 
-### Application
+### App 1 — Coordinator (`SftpDataFeed.cs`)
 
 | Function | Trigger | Description |
 |---|---|---|
-| `RunDataFeed` | Timer (daily) | Generates batch of 10 fake ACH payments, creates batch + payment entities in Table Storage, POSTs batch to processor |
-| `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as RunDataFeed but returns `{ batchId }` — used by E2E test script |
-| `BatchCompleted` | HTTP POST `/api/batch/callback` | Receives `SftpBatchCallback`, updates batch status in Table Storage |
-| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + payment statuses from Table Storage |
-| `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in BatchTracking table |
-| `ReceiveSftpRequest` | HTTP POST `/api/sftp/process` | Validates `SftpBatchRequest`, drops onto Storage Queue, returns 202 |
-| `ProcessSftpQueue` | Queue `sftp-processing-queue` | Starts Durable Functions orchestration with deterministic instance ID |
-| `SftpOrchestration` | Orchestration | Creates payment + GL CSV files sequentially, uploads to SFTP with retry, sends callback |
+| `RunDataFeed` | Timer (daily) | Generates batch of 10 fake ACH payments, creates batch + payment entities via `IBatchTracker`, POSTs batch to `ReceiveSftpRequest` |
+| `TriggerDataFeed` | HTTP POST `/api/datafeed/trigger` | Same as `RunDataFeed` but returns `{ batchId }` — used by E2E test script |
+| `BatchCompleted` | HTTP POST `/api/batch/callback` | Receives `SftpBatchCallback`, updates batch status via `IBatchTracker` |
+| `GetBatchStatus` | HTTP GET `/api/batch/{batchId}` | Returns batch + payment statuses from Table Storage via `IBatchTracker` |
+| `ClearBatchData` | HTTP DELETE `/api/batch` | Deletes all entities in `BatchTracking` table |
+
+### App 2 — Entry Points (`SftpProcessor.cs`)
+
+| Function | Trigger | Description |
+|---|---|---|
+| `ReceiveSftpRequest` | HTTP POST `/api/sftp/process` | Validates `SftpBatchRequest`, drops onto `sftp-processing-queue` via `IMessageQueue`, returns 202 |
+| `ProcessSftpQueue` | Queue `sftp-processing-queue` | Starts `SftpOrchestration` via `DurableTaskClient` with deterministic instance ID `sftp-{batchId}` |
 | `ProcessGLErrorQueue` | Queue `gl-error-queue` | Logs failed GL uploads (TODO: error email, manual retry endpoint) |
 
-### Testing / Verification
+### App 2 — Orchestrator + Activities (`SftpOrchestration.cs`)
+
+| Function | Type | Description |
+|---|---|---|
+| `SftpOrchestration` | Orchestrator | Calls activities sequentially: payment file → upload → GL file → upload → callback |
+| `CreatePaymentFile` | Activity | Builds payment CSV string from `SftpBatchRequest.Payments` (all fields including account/routing) |
+| `CreateGLFile` | Activity | Builds GL CSV string from `SftpBatchRequest.Payments` (excludes sensitive banking fields) |
+| `UploadFile` | Activity | Connects to SFTP via `ISftpClientFactory`, uploads file content. Used for both payment and GL files |
+| `SendCallback` | Activity | POSTs `SftpBatchCallback` to the `CallbackUrl` via `IHttpClientFactory` |
+| `SendToGLErrorQueue` | Activity | Queues `GLErrorMessage` to `gl-error-queue` via `IGLErrorQueue` |
+
+### Testing / Verification (`SftpOrchestration.cs`)
 
 | Function | Trigger | Description |
 |---|---|---|
-| `SftpOrchestration_ListFiles` | HTTP GET `/api/sftp/files` | Lists files on the SFTP server |
-| `SftpOrchestration_GetFile` | HTTP GET `/api/sftp/files/{fileName}` | Returns the contents of a file from the SFTP server |
+| `SftpOrchestration_ListFiles` | HTTP GET `/api/sftp/files` | Lists files on the SFTP server via `ISftpClientFactory` |
+| `SftpOrchestration_GetFile` | HTTP GET `/api/sftp/files/{fileName}` | Returns contents of a file from the SFTP server |
 | `SftpOrchestration_DeleteAllFiles` | HTTP DELETE `/api/sftp/files` | Deletes all files on SFTP server |
 
 ## Data Feed
@@ -454,19 +470,33 @@ The `SftpDataFeed` class (`SftpDataFeed.cs`) acts as the coordinator. It generat
 
 ### What it does
 
+`RunDataFeed` (Timer) and `TriggerDataFeed` (HTTP) share the same `GenerateBatch` private method:
+
 1. Generates 10 random ACH payments using Bogus (payor, payee, amount, account/routing numbers, date)
-2. Creates a batch entity and 10 payment entities in Table Storage (all fields stored)
-3. Queries back only Queued payments
-4. POSTs the entire batch to `POST /api/sftp/process` with a callback URL
-5. On successful submission, sets batch status to Processing
+2. Creates a batch entity and 10 payment entities in Table Storage via `IBatchTracker` (`BatchTracking.cs`)
+3. Queries back only Queued payments via `IBatchTracker.GetQueuedPaymentsAsync`
+4. POSTs the entire batch as an `SftpBatchRequest` to `ReceiveSftpRequest` (`SftpProcessor.cs`) at `POST /api/sftp/process`
+5. On successful submission, sets batch status to Processing via `IBatchTracker.UpdateBatchStatusAsync`
 6. On submission failure, sets batch status to Error
-7. When callbacks arrive: Processed logs "would notify third party", Error logs warning
+
+`BatchCompleted` receives callbacks from `SendCallback` (`SftpOrchestration.cs`):
+
+7. Processed → logs info (TODO: notify third party)
+8. Error → logs warning (TODO: send alert email)
 
 ### Triggering manually
+
+Via the admin endpoint (invokes `RunDataFeed` in `SftpDataFeed.cs` directly):
 
 ```bash
 curl -X POST http://localhost:7071/admin/functions/RunDataFeed \
   -H "Content-Type: application/json" -d '{}'
+```
+
+Or via the HTTP endpoint (invokes `TriggerDataFeed` in `SftpDataFeed.cs`, returns `{ batchId }`):
+
+```bash
+curl -X POST http://localhost:7071/api/datafeed/trigger
 ```
 
 ### Configuration
@@ -476,31 +506,31 @@ curl -X POST http://localhost:7071/admin/functions/RunDataFeed \
 | `PROCESSOR_BASE_URL` | Yes | Base URL of the SFTP processor (e.g., `http://localhost:7071`) |
 | `COORDINATOR_BASE_URL` | Yes | Base URL of the coordinator, used to build callback URLs |
 
-## SFTP Orchestration
+## SFTP Orchestration (`SftpOrchestration.cs`)
 
 ### How it works
 
-The orchestration receives an `SftpBatchRequest` containing a batch ID, list of payments, and a callback URL. It processes files **sequentially**:
+`SftpOrchestration.RunOrchestrator` receives an `SftpBatchRequest` (`Models.cs`) containing a batch ID, list of payments, and a callback URL. It calls activities **sequentially**:
 
-1. Creates a payment CSV (all fields including account/routing numbers)
-2. Uploads payment CSV to SFTP (retry policy: 3 attempts, 5s backoff)
-   - If upload fails after retries → callback Error, return early (no GL attempt)
-3. Creates a GL CSV (excludes sensitive banking fields)
-4. Uploads GL CSV to SFTP (retry policy: 3 attempts, 5s backoff)
-   - If upload fails after retries → queue to `gl-error-queue`, no callback (App 1 stays in Processing)
-5. If both succeed → callback Processed
+1. `CreatePaymentFile` — builds a payment CSV (all fields including account/routing numbers)
+2. `UploadFile` — uploads payment CSV to SFTP via `ISftpClientFactory` (`SftpClientFactory.cs`), retry policy: 3 attempts, 5s backoff
+   - If `UploadFile` fails after retries → `SendCallback` with Error status, return early (no GL attempt)
+3. `CreateGLFile` — builds a GL CSV (excludes sensitive banking fields)
+4. `UploadFile` — uploads GL CSV to SFTP, same retry policy
+   - If `UploadFile` fails after retries → `SendToGLErrorQueue` queues to `gl-error-queue` via `IGLErrorQueue` (`MessageQueue.cs`), no callback (App 1 stays in Processing)
+5. If both succeed → `SendCallback` with Processed status
 
 ### Request flow
 
 ```
-POST /api/sftp/process (SftpBatchRequest)
-  └─► 202 Accepted + message on sftp-processing-queue
+ReceiveSftpRequest (SftpProcessor.cs) — POST /api/sftp/process
+  └─► 202 Accepted + message on sftp-processing-queue via IMessageQueue (MessageQueue.cs)
         │
         ▼
-  ProcessSftpQueue (queue trigger)
+ProcessSftpQueue (SftpProcessor.cs) — queue trigger: sftp-processing-queue
         │
         ▼
-  SftpOrchestration (deterministic ID: sftp-{batchId})
+SftpOrchestration.RunOrchestrator (SftpOrchestration.cs) — deterministic ID: sftp-{batchId}
         │
         ▼
   CreatePaymentFile → UploadFile (payment CSV, with retry)
@@ -514,11 +544,13 @@ POST /api/sftp/process (SftpBatchRequest)
         │
         ▼
   SendCallback(Processed)
+
+  All activities above are in SftpOrchestration.cs
 ```
 
-### Request schema
+### Request schema (`Models.cs`)
 
-**POST /api/sftp/process**:
+**POST /api/sftp/process** — handled by `ReceiveSftpRequest` (`SftpProcessor.cs`), body is `SftpBatchRequest`:
 ```json
 {
   "batchId": "string",
@@ -537,7 +569,7 @@ POST /api/sftp/process (SftpBatchRequest)
 }
 ```
 
-**Callback payload (POST to callbackUrl)**:
+**Callback payload** — sent by `SendCallback` (`SftpOrchestration.cs`) to `BatchCompleted` (`SftpDataFeed.cs`), body is `SftpBatchCallback`:
 ```json
 {
   "batchId": "string",
@@ -547,24 +579,24 @@ POST /api/sftp/process (SftpBatchRequest)
 
 ### Error handling
 
-- **Payment SFTP failure**: Activity retry policy (3 attempts, 5s backoff). If all retries fail, sends Error callback and stops — GL file is never attempted.
-- **GL SFTP failure**: Activity retry policy (3 attempts, 5s backoff). If all retries fail, queues a `GLErrorMessage` to `gl-error-queue`. No callback is sent — batch stays in Processing until manual retry.
-- **Callback failure**: `SendCallback` has its own retry policy (3 attempts, 5s backoff). If the callback fails after retries, the batch gets stuck in Processing (see open TODOs).
-- **Queue delivery failure**: Azure retries up to 5x (`maxDequeueCount` in host.json), then moves to `sftp-processing-queue-poison`.
-- **Duplicate orchestration**: Deterministic instance ID (`sftp-{batchId}`) makes duplicate starts a no-op.
-- **Idempotent batch status**: Terminal status updates (on an already-terminal batch) are skipped.
+- **Payment `UploadFile` failure** (`SftpOrchestration.cs`): Activity retry policy (3 attempts, 5s backoff). If all retries fail, `SendCallback` sends Error to `BatchCompleted` (`SftpDataFeed.cs`) and the orchestrator returns early — `CreateGLFile` is never called.
+- **GL `UploadFile` failure** (`SftpOrchestration.cs`): Activity retry policy (3 attempts, 5s backoff). If all retries fail, `SendToGLErrorQueue` queues a `GLErrorMessage` to `gl-error-queue`. No callback is sent — batch stays in Processing until manual retry.
+- **`SendCallback` failure** (`SftpOrchestration.cs`): Has its own retry policy (3 attempts, 5s backoff). If the callback to `BatchCompleted` fails after retries, the batch gets stuck in Processing (see open TODOs).
+- **Queue delivery failure**: `ProcessSftpQueue` (`SftpProcessor.cs`) retries up to 5x (`maxDequeueCount` in `host.json`), then Azure moves the message to `sftp-processing-queue-poison`.
+- **Duplicate orchestration**: `ProcessSftpQueue` (`SftpProcessor.cs`) sets the instance ID to `sftp-{batchId}`, making duplicate starts a no-op.
+- **Idempotent batch status**: `UpdateBatchStatusAsync` in `TableBatchTracker` (`BatchTracking.cs`) skips updates if the batch is already in a terminal state.
 
 ### Viewing files on the SFTP server
 
 There are three ways to see what's been uploaded:
 
-**Via the API (easiest):**
+**Via the API (easiest)** — uses `SftpOrchestration_ListFiles` and `SftpOrchestration_GetFile` (`SftpOrchestration.cs`):
 
 ```bash
-# List all files on the SFTP server
+# List all files on the SFTP server (SftpOrchestration_ListFiles)
 curl http://localhost:7071/api/sftp/files
 
-# Read a specific file's contents
+# Read a specific file's contents (SftpOrchestration_GetFile)
 curl http://localhost:7071/api/sftp/files/{fileName}
 ```
 
@@ -597,20 +629,20 @@ dotnet test tests/AzFunctions.Tests/ --collect:"XPlat Code Coverage"    # with c
 **Option A: Trigger a batch and check status**
 
 ```bash
-# 1. Trigger the data feed — returns the batchId
+# 1. TriggerDataFeed (SftpDataFeed.cs) — returns the batchId
 curl -s -X POST http://localhost:7071/api/datafeed/trigger | python3 -m json.tool
 
-# 2. Check batch status (replace BATCH_ID)
+# 2. GetBatchStatus (SftpDataFeed.cs) — replace BATCH_ID
 curl -s http://localhost:7071/api/batch/BATCH_ID | python3 -m json.tool
 
-# 3. Check uploaded files
+# 3. SftpOrchestration_ListFiles (SftpOrchestration.cs) — check uploaded files
 curl -s http://localhost:7071/api/sftp/files | python3 -m json.tool
 
-# 4. Read a specific file
+# 4. SftpOrchestration_GetFile (SftpOrchestration.cs) — read a specific file
 curl -s http://localhost:7071/api/sftp/files/payment_BATCH_ID.csv
 ```
 
-**Option B: Submit a batch directly**
+**Option B: Submit a batch directly to `ReceiveSftpRequest` (`SftpProcessor.cs`)**
 
 ```bash
 curl -s -X POST http://localhost:7071/api/sftp/process \
@@ -627,8 +659,11 @@ curl -s -X POST http://localhost:7071/api/sftp/process \
 **Cleanup endpoints** (useful between manual test runs):
 
 ```bash
-curl -s -X DELETE http://localhost:7071/api/batch       # clear batch tracking data
-curl -s -X DELETE http://localhost:7071/api/sftp/files   # clear SFTP files
+# ClearBatchData (SftpDataFeed.cs) — clear batch tracking data
+curl -s -X DELETE http://localhost:7071/api/batch
+
+# SftpOrchestration_DeleteAllFiles (SftpOrchestration.cs) — clear SFTP files
+curl -s -X DELETE http://localhost:7071/api/sftp/files
 ```
 
 ### End-to-end test
@@ -682,9 +717,9 @@ Summary:
   Result: PASS
 ```
 
-## SFTP via SSH.NET
+## SFTP via SSH.NET (`SftpClientFactory.cs`)
 
-SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`) via `ISftpClientFactory`. The factory reads SFTP config from environment variables once at startup, validates the port, and creates connected `SftpClient` instances. Each Durable Functions activity creates a new connection — pooling is not feasible across activity invocations.
+SFTP connectivity is provided by [SSH.NET](https://github.com/sshnet/SSH.NET) (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory` (`SftpClientFactory.cs`). The factory reads SFTP config from environment variables once at startup, validates the port, and creates connected `SftpClient` instances. The `UploadFile` activity (`SftpOrchestration.cs`) creates a new connection per invocation — pooling is not feasible across Durable Functions activity invocations.
 
 ### Configuration
 

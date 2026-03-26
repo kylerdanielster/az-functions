@@ -5,7 +5,7 @@ using NSubstitute.ExceptionExtensions;
 
 namespace AzFunctions.Tests;
 
-public class SftpOrchestrationTests
+public class BatchOrchestrationTests
 {
     private static List<PaymentData> CreateTestPayments() =>
     [
@@ -31,24 +31,24 @@ public class SftpOrchestrationTests
         var context = CreateMockContext();
 
         // File content creation succeeds
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("payment csv content");
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("gl csv content");
 
         // Uploads succeed
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("Uploaded.");
 
         // Capture callback inputs
-        var callbackInputs = new List<SftpOrchestration.SendCallbackInput>();
-        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Do<object>(o =>
+        var callbackInputs = new List<BatchOrchestration.SendCallbackInput>();
+        context.CallActivityAsync(nameof(BatchOrchestration.SendCallback), Arg.Do<object>(o =>
         {
-            if (o is SftpOrchestration.SendCallbackInput input) callbackInputs.Add(input);
+            if (o is BatchOrchestration.SendCallbackInput input) callbackInputs.Add(input);
         }), Arg.Any<TaskOptions>())
             .Returns(Task.CompletedTask);
 
-        string result = await SftpOrchestration.RunOrchestrator(context);
+        string result = await BatchOrchestration.RunOrchestrator(context);
 
         Assert.Contains("Uploaded 2 files", result);
 
@@ -64,27 +64,27 @@ public class SftpOrchestrationTests
         var context = CreateMockContext();
 
         // Payment file content creation succeeds
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("payment csv content");
 
         // Payment upload fails
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .ThrowsAsync(new TaskFailedException("UploadFile", 1, new ApplicationException("SFTP connection failed")));
 
         // Capture callback inputs
-        var callbackInputs = new List<SftpOrchestration.SendCallbackInput>();
-        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Do<object>(o =>
+        var callbackInputs = new List<BatchOrchestration.SendCallbackInput>();
+        context.CallActivityAsync(nameof(BatchOrchestration.SendCallback), Arg.Do<object>(o =>
         {
-            if (o is SftpOrchestration.SendCallbackInput input) callbackInputs.Add(input);
+            if (o is BatchOrchestration.SendCallbackInput input) callbackInputs.Add(input);
         }), Arg.Any<TaskOptions>())
             .Returns(Task.CompletedTask);
 
-        string result = await SftpOrchestration.RunOrchestrator(context);
+        string result = await BatchOrchestration.RunOrchestrator(context);
 
         Assert.Contains("Payment file upload failed", result);
 
         // GL file should never be created
-        await context.DidNotReceive().CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile),
+        await context.DidNotReceive().CallActivityAsync<string>(nameof(BatchOrchestration.CreateGLFile),
             Arg.Any<object>(), Arg.Any<TaskOptions>());
 
         // Only one callback (Error) with correct payload
@@ -99,34 +99,34 @@ public class SftpOrchestrationTests
         var context = CreateMockContext();
 
         // File content creation succeeds
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("payment csv content");
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("gl csv content");
 
         // Payment upload succeeds, GL upload fails
-        var paymentInput = new SftpOrchestration.UploadFileInput("payment_batch1.csv", "payment csv content");
-        var glInput = new SftpOrchestration.UploadFileInput("gl_batch1.csv", "gl csv content");
+        var paymentInput = new BatchOrchestration.UploadFileInput("payment_batch1.csv", "payment csv content");
+        var glInput = new BatchOrchestration.UploadFileInput("gl_batch1.csv", "gl csv content");
 
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), paymentInput, Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.UploadFile), paymentInput, Arg.Any<TaskOptions>())
             .Returns("Uploaded.");
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), glInput, Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.UploadFile), glInput, Arg.Any<TaskOptions>())
             .ThrowsAsync(new TaskFailedException("UploadFile", 1, new ApplicationException("SFTP connection failed")));
 
         // Callbacks succeed
-        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync(nameof(BatchOrchestration.SendCallback), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns(Task.CompletedTask);
 
-        string result = await SftpOrchestration.RunOrchestrator(context);
+        string result = await BatchOrchestration.RunOrchestrator(context);
 
         Assert.Contains("GL file upload failed", result);
 
         // No callbacks — Processing is set by App 1, and no Processed after GL failure
-        await context.DidNotReceive().CallActivityAsync(nameof(SftpOrchestration.SendCallback),
+        await context.DidNotReceive().CallActivityAsync(nameof(BatchOrchestration.SendCallback),
             Arg.Any<object>(), Arg.Any<TaskOptions>());
 
         // GL error queued
-        await context.Received(1).CallActivityAsync(nameof(SftpOrchestration.SendToGLErrorQueue),
+        await context.Received(1).CallActivityAsync(nameof(BatchOrchestration.SendToGLErrorQueue),
             Arg.Any<object>(), Arg.Any<TaskOptions>());
     }
 
@@ -136,21 +136,21 @@ public class SftpOrchestrationTests
         var context = CreateMockContext();
 
         // File content creation succeeds
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreatePaymentFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("payment csv content");
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.CreateGLFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("gl csv content");
 
         // Uploads succeed
-        context.CallActivityAsync<string>(nameof(SftpOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync<string>(nameof(BatchOrchestration.UploadFile), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .Returns("Uploaded.");
 
         // Callbacks fail
-        context.CallActivityAsync(nameof(SftpOrchestration.SendCallback), Arg.Any<object>(), Arg.Any<TaskOptions>())
+        context.CallActivityAsync(nameof(BatchOrchestration.SendCallback), Arg.Any<object>(), Arg.Any<TaskOptions>())
             .ThrowsAsync(new TaskFailedException("SendCallback", 1, new ApplicationException("Connection refused")));
 
         // Should NOT throw — callback failure is isolated
-        string result = await SftpOrchestration.RunOrchestrator(context);
+        string result = await BatchOrchestration.RunOrchestrator(context);
 
         Assert.Contains("Uploaded 2 files", result);
     }

@@ -4,7 +4,7 @@ namespace AzFunctions;
 
 /// <summary>
 /// Abstraction over a message queue for testability.
-/// Used by <see cref="SftpProcessor"/> to decouple from the concrete <see cref="QueueClient"/>.
+/// Used by <see cref="BatchProcessor"/> to decouple from the concrete <see cref="QueueClient"/>.
 /// </summary>
 public interface IMessageQueue
 {

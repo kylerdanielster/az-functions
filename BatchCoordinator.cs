@@ -12,7 +12,7 @@ namespace AzFunctions;
 /// Coordinator (App 1). Generates fake ACH payment batches, submits the entire batch to the SFTP Processor,
 /// and receives status callbacks to track batch progress.
 /// </summary>
-public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker batchTracker)
+public class BatchCoordinator(IHttpClientFactory httpClientFactory, IBatchTracker batchTracker)
 {
     private const int BatchSize = 10;
 
@@ -30,7 +30,7 @@ public class SftpDataFeed(IHttpClientFactory httpClientFactory, IBatchTracker ba
         [TimerTrigger("0 0 0 * * *")] TimerInfo timerInfo,
         FunctionContext executionContext)
     {
-        ILogger logger = executionContext.GetLogger(nameof(SftpDataFeed));
+        ILogger logger = executionContext.GetLogger(nameof(BatchCoordinator));
 
         try
         {

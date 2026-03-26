@@ -6,7 +6,7 @@ using NSubstitute;
 
 namespace AzFunctions.Tests;
 
-public class ProcessSftpQueueTests
+public class ProcessBatchQueueTests
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -14,7 +14,7 @@ public class ProcessSftpQueueTests
     };
 
     private readonly DurableTaskClient durableClient = Substitute.For<DurableTaskClient>("test");
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpProcessor.ProcessSftpQueue));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ProcessSftpQueue));
 
     [Fact]
     public async Task ValidMessage_StartsOrchestrationWithDeterministicId()
@@ -27,10 +27,10 @@ public class ProcessSftpQueueTests
 
         string messageText = JsonSerializer.Serialize(request, JsonOptions);
 
-        await SftpProcessor.ProcessSftpQueue(messageText, durableClient, context);
+        await BatchProcessor.ProcessSftpQueue(messageText, durableClient, context);
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
-            nameof(SftpOrchestration),
+            nameof(BatchOrchestration),
             Arg.Any<BatchRequest>(),
             Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "sftp-batch1"));
     }
@@ -41,7 +41,7 @@ public class ProcessSftpQueueTests
         string messageText = "null";
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => SftpProcessor.ProcessSftpQueue(messageText, durableClient, context));
+            () => BatchProcessor.ProcessSftpQueue(messageText, durableClient, context));
     }
 
     [Fact]
@@ -50,7 +50,7 @@ public class ProcessSftpQueueTests
         string messageText = "not valid json";
 
         await Assert.ThrowsAsync<JsonException>(
-            () => SftpProcessor.ProcessSftpQueue(messageText, durableClient, context));
+            () => BatchProcessor.ProcessSftpQueue(messageText, durableClient, context));
     }
 
     [Fact]
@@ -64,10 +64,10 @@ public class ProcessSftpQueueTests
 
         string messageText = JsonSerializer.Serialize(request, JsonOptions);
 
-        await SftpProcessor.ProcessSftpQueue(messageText, durableClient, context);
+        await BatchProcessor.ProcessSftpQueue(messageText, durableClient, context);
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
-            nameof(SftpOrchestration),
+            nameof(BatchOrchestration),
             Arg.Any<BatchRequest>(),
             Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "sftp-abc123"));
     }

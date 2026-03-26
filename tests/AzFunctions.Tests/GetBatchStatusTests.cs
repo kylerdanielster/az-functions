@@ -10,9 +10,9 @@ public class GetBatchStatusTests
 {
     private readonly IBatchTracker batchTracker = Substitute.For<IBatchTracker>();
     private readonly IHttpClientFactory httpClientFactory = Substitute.For<IHttpClientFactory>();
-    private readonly FunctionContext context = new FakeFunctionContext(nameof(SftpDataFeed.GetBatchStatus));
+    private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchCoordinator.GetBatchStatus));
 
-    private SftpDataFeed CreateDataFeed() => new(httpClientFactory, batchTracker);
+    private BatchCoordinator CreateDataFeed() => new(httpClientFactory, batchTracker);
 
     [Fact]
     public async Task BatchNotFound_Returns404()
