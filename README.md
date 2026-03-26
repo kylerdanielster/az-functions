@@ -34,7 +34,8 @@ This file is gitignored. Create it in the project root:
     "SFTP_PASSWORD": "testpass",
     "SFTP_REMOTE_PATH": "/config/upload",
     "PROCESSOR_BASE_URL": "http://localhost:7071",
-    "COORDINATOR_BASE_URL": "http://localhost:7071"
+    "COORDINATOR_BASE_URL": "http://localhost:7071",
+    "BatchStorageConnection": "UseDevelopmentStorage=true"
   }
 }
 ```
@@ -419,7 +420,7 @@ The POC uses a single `AzureWebJobsStorage` connection string for simplicity. In
 |---|---|---|---|
 | **Durable Functions** (blob/table) | `AzureWebJobsStorage` | `AzureWebJobsStorage` | Orchestration state, history, checkpoints — managed by the runtime |
 | **Table Storage** (`BatchTracking`) | `AzureWebJobsStorage` | Dedicated storage account | Batch metadata and payment status tracking — application data |
-| **Queue Storage** (`batch-processing-queue`) | `AzureWebJobsStorage` | Dedicated storage account | Decouples HTTP acceptance from orchestration — application data |
+| **Queue Storage** (`batch-processing-queue`, `gl-error-queue`) | `BatchStorageConnection` | Dedicated storage account | Decouples HTTP acceptance from orchestration — application data |
 
 **Why separate?** `AzureWebJobsStorage` is the function app's internal storage — it holds lease blobs, host IDs, durable task history, and other runtime state. Mixing application tables and queues into this account couples your data to the runtime's lifecycle and makes independent management (backup, scaling, access control) harder.
 

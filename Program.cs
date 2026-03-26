@@ -28,8 +28,8 @@ builder.Services.AddSingleton<IBatchTracker>(sp =>
 
 builder.Services.AddSingleton<IMessageQueue>(sp =>
 {
-    string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
-        ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
+    string connectionString = Environment.GetEnvironmentVariable("BatchStorageConnection")
+        ?? throw new InvalidOperationException("BatchStorageConnection not configured.");
     var queueClient = new QueueClient(connectionString, BatchProcessor.QueueName, new QueueClientOptions
     {
         MessageEncoding = QueueMessageEncoding.Base64
@@ -40,8 +40,8 @@ builder.Services.AddSingleton<IMessageQueue>(sp =>
 
 builder.Services.AddSingleton<IGLErrorQueue>(sp =>
 {
-    string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
-        ?? throw new InvalidOperationException("AzureWebJobsStorage not configured.");
+    string connectionString = Environment.GetEnvironmentVariable("BatchStorageConnection")
+        ?? throw new InvalidOperationException("BatchStorageConnection not configured.");
     var queueClient = new QueueClient(connectionString, BatchProcessor.GLErrorQueueName, new QueueClientOptions
     {
         MessageEncoding = QueueMessageEncoding.Base64

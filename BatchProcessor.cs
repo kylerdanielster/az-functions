@@ -71,7 +71,7 @@ public class BatchProcessor(IMessageQueue messageQueue)
     /// </summary>
     [Function(nameof(ProcessBatchQueue))]
     public static async Task ProcessBatchQueue(
-        [QueueTrigger(QueueName)] string messageText,
+        [QueueTrigger(QueueName, Connection = "BatchStorageConnection")] string messageText,
         [DurableClient] DurableTaskClient durableClient,
         FunctionContext executionContext)
     {
@@ -97,7 +97,7 @@ public class BatchProcessor(IMessageQueue messageQueue)
     /// </summary>
     [Function(nameof(ProcessGLErrorQueue))]
     public static void ProcessGLErrorQueue(
-        [QueueTrigger(GLErrorQueueName)] string messageText,
+        [QueueTrigger(GLErrorQueueName, Connection = "BatchStorageConnection")] string messageText,
         FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(ProcessGLErrorQueue));
