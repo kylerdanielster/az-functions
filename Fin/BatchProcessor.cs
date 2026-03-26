@@ -13,7 +13,7 @@ namespace AzFunctions;
 /// queues them via <see cref="IMessageQueue"/> for reliable delivery, and starts Durable Functions orchestrations.
 /// Also processes GL error queue messages for failed GL uploads.
 /// </summary>
-public class BatchProcessor(IMessageQueue messageQueue)
+public class BatchProcessor(IMessageQueue messageQueue, IBatchPaymentStore batchPaymentStore)
 {
     public const string QueueName = "batch-processing-queue";
     public const string GLErrorQueueName = "gl-error-queue";
@@ -24,9 +24,9 @@ public class BatchProcessor(IMessageQueue messageQueue)
     };
 
     /// <summary>
-    /// Accepts a batch processing request, validates required fields, drops it onto a
-    /// Storage Queue, and returns 202 Accepted. Returns 400 if the body is null or
-    /// if BatchId, CallbackUrl, or Payments are missing/empty.
+    /// Accepts a batch processing request, validates required fields, stores payment data
+    /// in Table Storage, enqueues a lightweight reference, and returns 202 Accepted.
+    /// Returns 400 if the body is null or if BatchId, CallbackUrl, or Payments are missing/empty.
     /// Route: POST /api/batch/process
     /// </summary>
     [Function(nameof(ReceiveBatchRequest))]
@@ -54,10 +54,12 @@ public class BatchProcessor(IMessageQueue messageQueue)
             return badRequest;
         }
 
-        string message = JsonSerializer.Serialize(request, JsonOptions);
+        await batchPaymentStore.StoreBatchAsync(request.BatchId, request.CallbackUrl, request.Payments);
+
+        string message = JsonSerializer.Serialize(new BatchQueueMessage(request.BatchId), JsonOptions);
         await messageQueue.SendMessageAsync(message);
 
-        logger.LogInformation("[Batch] Queued batch processing request for batch {batchId} ({paymentCount} payments).",
+        logger.LogInformation("[Batch] Stored and queued batch {batchId} ({paymentCount} payments).",
             request.BatchId, request.Payments.Count);
 
         var response = req.CreateResponse(HttpStatusCode.Accepted);
@@ -66,28 +68,30 @@ public class BatchProcessor(IMessageQueue messageQueue)
     }
 
     /// <summary>
-    /// Queue trigger that deserializes a batch processing request and starts a BatchOrchestration
-    /// with a deterministic instance ID (batch-{batchId}) to prevent duplicates.
+    /// Queue trigger that deserializes a batch reference, reads the callback URL from Table Storage,
+    /// and starts a BatchOrchestration with a deterministic instance ID (batch-{batchId}).
     /// </summary>
     [Function(nameof(ProcessBatchQueue))]
-    public static async Task ProcessBatchQueue(
+    public async Task ProcessBatchQueue(
         [QueueTrigger(QueueName, Connection = "BatchStorageConnection")] string messageText,
         [DurableClient] DurableTaskClient durableClient,
         FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(ProcessBatchQueue));
 
-        var request = JsonSerializer.Deserialize<BatchRequest>(messageText, JsonOptions)
+        var queueMessage = JsonSerializer.Deserialize<BatchQueueMessage>(messageText, JsonOptions)
             ?? throw new InvalidOperationException("Failed to deserialize queue message.");
 
-        string instanceId = $"batch-{request.BatchId}";
+        string callbackUrl = await batchPaymentStore.GetCallbackUrlAsync(queueMessage.BatchId);
+        string instanceId = $"batch-{queueMessage.BatchId}";
 
-        logger.LogInformation("[Batch] Starting orchestration {instanceId} for batch {batchId} ({paymentCount} payments).",
-            instanceId, request.BatchId, request.Payments.Count);
+        logger.LogInformation("[Batch] Starting orchestration {instanceId} for batch {batchId}.",
+            instanceId, queueMessage.BatchId);
 
+        var input = new BatchOrchestrationInput(queueMessage.BatchId, callbackUrl);
         await durableClient.ScheduleNewOrchestrationInstanceAsync(
             nameof(BatchOrchestration),
-            request,
+            input,
             new StartOrchestrationOptions { InstanceId = instanceId });
     }
 

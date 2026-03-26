@@ -7,21 +7,13 @@ namespace AzFunctions.Tests;
 
 public class BatchOrchestrationTests
 {
-    private static List<PaymentData> CreateTestPayments() =>
-    [
-        new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
-            "1234567890", "021000021", "2026-03-15"),
-        new PaymentData("pmt-001", "Jane Smith", "Globex Inc", 2750.50m,
-            "9876543210", "021000089", "2026-03-14")
-    ];
-
     private static TaskOrchestrationContext CreateMockContext()
     {
         var context = Substitute.For<TaskOrchestrationContext>();
         context.InstanceId.Returns("batch-batch1");
         context.CreateReplaySafeLogger(Arg.Any<string>()).Returns(Substitute.For<ILogger>());
-        context.GetInput<BatchRequest>().Returns(new BatchRequest(
-            "batch1", CreateTestPayments(), "http://localhost/callback"));
+        context.GetInput<BatchOrchestrationInput>().Returns(new BatchOrchestrationInput(
+            "batch1", "http://localhost/callback"));
         return context;
     }
 

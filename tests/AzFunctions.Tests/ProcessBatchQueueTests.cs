@@ -13,25 +13,25 @@ public class ProcessBatchQueueTests
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
+    private readonly IMessageQueue messageQueue = Substitute.For<IMessageQueue>();
+    private readonly IBatchPaymentStore batchPaymentStore = Substitute.For<IBatchPaymentStore>();
     private readonly DurableTaskClient durableClient = Substitute.For<DurableTaskClient>("test");
     private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchProcessor.ProcessBatchQueue));
+
+    private BatchProcessor CreateProcessor() => new(messageQueue, batchPaymentStore);
 
     [Fact]
     public async Task ValidMessage_StartsOrchestrationWithDeterministicId()
     {
-        var request = new BatchRequest("batch1",
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
-                "1234567890", "021000021", "2026-03-15")
-        ], "http://localhost/callback");
+        var queueMessage = new BatchQueueMessage("batch1");
+        string messageText = JsonSerializer.Serialize(queueMessage, JsonOptions);
+        batchPaymentStore.GetCallbackUrlAsync("batch1").Returns("http://localhost/callback");
 
-        string messageText = JsonSerializer.Serialize(request, JsonOptions);
-
-        await BatchProcessor.ProcessBatchQueue(messageText, durableClient, context);
+        await CreateProcessor().ProcessBatchQueue(messageText, durableClient, context);
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
             nameof(BatchOrchestration),
-            Arg.Any<BatchRequest>(),
+            Arg.Is<BatchOrchestrationInput>(i => i.BatchId == "batch1" && i.CallbackUrl == "http://localhost/callback"),
             Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "batch-batch1"));
     }
 
@@ -41,7 +41,7 @@ public class ProcessBatchQueueTests
         string messageText = "null";
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => BatchProcessor.ProcessBatchQueue(messageText, durableClient, context));
+            () => CreateProcessor().ProcessBatchQueue(messageText, durableClient, context));
     }
 
     [Fact]
@@ -50,25 +50,21 @@ public class ProcessBatchQueueTests
         string messageText = "not valid json";
 
         await Assert.ThrowsAsync<JsonException>(
-            () => BatchProcessor.ProcessBatchQueue(messageText, durableClient, context));
+            () => CreateProcessor().ProcessBatchQueue(messageText, durableClient, context));
     }
 
     [Fact]
     public async Task InstanceId_IncludesBatchId()
     {
-        var request = new BatchRequest("abc123",
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
-                "1234567890", "021000021", "2026-03-15")
-        ], "http://localhost/callback");
+        var queueMessage = new BatchQueueMessage("abc123");
+        string messageText = JsonSerializer.Serialize(queueMessage, JsonOptions);
+        batchPaymentStore.GetCallbackUrlAsync("abc123").Returns("http://localhost/callback");
 
-        string messageText = JsonSerializer.Serialize(request, JsonOptions);
-
-        await BatchProcessor.ProcessBatchQueue(messageText, durableClient, context);
+        await CreateProcessor().ProcessBatchQueue(messageText, durableClient, context);
 
         await durableClient.Received(1).ScheduleNewOrchestrationInstanceAsync(
             nameof(BatchOrchestration),
-            Arg.Any<BatchRequest>(),
+            Arg.Any<BatchOrchestrationInput>(),
             Arg.Is<StartOrchestrationOptions>(o => o.InstanceId == "batch-abc123"));
     }
 }

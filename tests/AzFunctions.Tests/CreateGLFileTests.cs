@@ -1,21 +1,31 @@
 using AzFunctions.Tests.Helpers;
+using NSubstitute;
 
 namespace AzFunctions.Tests;
 
 public class CreateGLFileTests
 {
+    private readonly IBatchPaymentStore batchPaymentStore = Substitute.For<IBatchPaymentStore>();
     private readonly FunctionContext context = new FakeFunctionContext(nameof(BatchOrchestration.CreateGLFile));
 
-    [Fact]
-    public void SinglePayment_ProducesCorrectCsv()
-    {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1",
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
-                "1234567890", "021000021", "2026-03-15")
-        ]);
+    private BatchOrchestration CreateOrchestration() => new(
+        Substitute.For<IHttpClientFactory>(),
+        Substitute.For<ISftpClientFactory>(),
+        Substitute.For<IGLErrorQueue>(),
+        batchPaymentStore);
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+    private void SetupPayments(params PaymentData[] payments)
+    {
+        batchPaymentStore.GetPaymentsAsync("batch1").Returns(payments.ToList());
+    }
+
+    [Fact]
+    public async Task SinglePayment_ProducesCorrectCsv()
+    {
+        SetupPayments(new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
+            "1234567890", "021000021", "2026-03-15"));
+
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         var lines = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(2, lines.Length);
@@ -24,39 +34,33 @@ public class CreateGLFileTests
     }
 
     [Fact]
-    public void ExcludesAccountNumber()
+    public async Task ExcludesAccountNumber()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1",
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
-                "SENSITIVE_ACCT", "SENSITIVE_RTN", "2026-03-15")
-        ]);
+        SetupPayments(new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
+            "SENSITIVE_ACCT", "SENSITIVE_RTN", "2026-03-15"));
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         Assert.DoesNotContain("SENSITIVE_ACCT", csv);
     }
 
     [Fact]
-    public void ExcludesRoutingNumber()
+    public async Task ExcludesRoutingNumber()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1",
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
-                "SENSITIVE_ACCT", "SENSITIVE_RTN", "2026-03-15")
-        ]);
+        SetupPayments(new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m,
+            "SENSITIVE_ACCT", "SENSITIVE_RTN", "2026-03-15"));
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         Assert.DoesNotContain("SENSITIVE_RTN", csv);
     }
 
     [Fact]
-    public void HeaderDoesNotContainSensitiveColumns()
+    public async Task HeaderDoesNotContainSensitiveColumns()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1", []);
+        SetupPayments();
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         var header = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)[0];
         Assert.DoesNotContain("AccountNumber", header);
@@ -64,26 +68,24 @@ public class CreateGLFileTests
     }
 
     [Fact]
-    public void MultiplePayments_ProducesOneRowPerPayment()
+    public async Task MultiplePayments_ProducesOneRowPerPayment()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1",
-        [
+        SetupPayments(
             new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15"),
-            new PaymentData("pmt-001", "Jane Smith", "Globex Inc", 2750.50m, "9876543210", "021000089", "2026-03-14")
-        ]);
+            new PaymentData("pmt-001", "Jane Smith", "Globex Inc", 2750.50m, "9876543210", "021000089", "2026-03-14"));
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         var lines = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(3, lines.Length);
     }
 
     [Fact]
-    public void EmptyPayments_ProducesHeaderOnly()
+    public async Task EmptyPayments_ProducesHeaderOnly()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1", []);
+        SetupPayments();
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         var lines = csv.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         Assert.Single(lines);
@@ -91,29 +93,23 @@ public class CreateGLFileTests
     }
 
     [Fact]
-    public void FieldWithComma_IsQuoted()
+    public async Task FieldWithComma_IsQuoted()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1",
-        [
-            new PaymentData("pmt-000", "Doe, John", "Acme Corp", 1500.00m,
-                "1234567890", "021000021", "2026-03-15")
-        ]);
+        SetupPayments(new PaymentData("pmt-000", "Doe, John", "Acme Corp", 1500.00m,
+            "1234567890", "021000021", "2026-03-15"));
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         Assert.Contains("\"Doe, John\"", csv);
     }
 
     [Fact]
-    public void AmountFormatted_TwoDecimalPlaces()
+    public async Task AmountFormatted_TwoDecimalPlaces()
     {
-        var input = new BatchOrchestration.CreateGLFileInput("batch1",
-        [
-            new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500m,
-                "1234567890", "021000021", "2026-03-15")
-        ]);
+        SetupPayments(new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500m,
+            "1234567890", "021000021", "2026-03-15"));
 
-        string csv = BatchOrchestration.CreateGLFile(input, context);
+        string csv = await CreateOrchestration().CreateGLFile("batch1", context);
 
         Assert.Contains("1500.00", csv);
     }

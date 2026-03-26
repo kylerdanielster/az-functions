@@ -11,6 +11,18 @@ public record PaymentData(string PaymentId, string PayorName, string PayeeName,
 public record BatchRequest(string BatchId, List<PaymentData> Payments, string CallbackUrl);
 
 /// <summary>
+/// Lightweight queue message containing only the batch reference.
+/// Payment data is stored in the BatchPayments table and read by activities.
+/// </summary>
+public record BatchQueueMessage(string BatchId);
+
+/// <summary>
+/// Orchestration input containing the batch reference and callback URL.
+/// Activities read payment data from the BatchPayments table using BatchId.
+/// </summary>
+public record BatchOrchestrationInput(string BatchId, string CallbackUrl);
+
+/// <summary>
 /// Callback payload sent from the SFTP Processor (App 2) back to the Coordinator (App 1)
 /// with the current batch status.
 /// </summary>

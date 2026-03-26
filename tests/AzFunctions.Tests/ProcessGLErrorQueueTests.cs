@@ -17,7 +17,6 @@ public class ProcessGLErrorQueueTests
     {
         var errorMessage = new BatchOrchestration.GLErrorMessage(
             "batch1",
-            [new PaymentData("pmt-000", "John Doe", "Acme Corp", 1500.00m, "1234567890", "021000021", "2026-03-15")],
             "http://localhost/callback",
             "SFTP connection failed");
 

@@ -17,9 +17,9 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 4. `ClearBatchData` (HTTP DELETE) — clears BatchTracking table (test cleanup)
 
 **App 2: Batch Processor** (`BatchProcessor.cs` + `BatchOrchestration.cs`)
-1. `ReceiveBatchRequest` (HTTP) — validates `BatchRequest` (BatchId, Payments, CallbackUrl), drops onto Storage Queue via `IMessageQueue`, returns 202
-2. `ProcessBatchQueue` (Queue Trigger) — starts Durable Functions orchestration with deterministic ID (`batch-{batchId}`)
-3. `BatchOrchestration` (Orchestrator) — processes files **sequentially**: payment file first, then GL only if payment succeeds. Callbacks for terminal states only:
+1. `ReceiveBatchRequest` (HTTP) — validates `BatchRequest` (BatchId, Payments, CallbackUrl), stores payment data in `BatchPayments` table via `IBatchPaymentStore`, enqueues lightweight `BatchQueueMessage` (BatchId only), returns 202
+2. `ProcessBatchQueue` (Queue Trigger) — reads callback URL from `BatchPayments` table, starts Durable Functions orchestration with `BatchOrchestrationInput` (BatchId, CallbackUrl) and deterministic ID (`batch-{batchId}`)
+3. `BatchOrchestration` (Orchestrator) — processes files **sequentially**: payment file first, then GL only if payment succeeds. Activities read payment data from `BatchPayments` table via `IBatchPaymentStore`. Callbacks for terminal states only:
    - Payment SFTP fails → callback `Error`, return early (no GL attempt)
    - GL SFTP succeeds → callback `Processed`
    - GL SFTP fails → queue to `gl-error-queue`, NO callback (App 1 stays in `Processing`)
@@ -29,25 +29,31 @@ Two-app architecture for batch payment processing using HTTP + Storage Queue + c
 
 **Batch tracking**: Azure Table Storage (`BatchTracking` table) via `IBatchTracker` / `TableBatchTracker`. Two entity levels: batch (PK: "batch", RK: batchId) and payment (PK: batchId, RK: paymentId, EntityType: "payment"). Each batch has 10 payment entities (pmt-000 through pmt-009) with all PaymentData fields stored. `UpdateBatchStatusAsync` handles status transitions — when terminal (Processed/Error), sets `CompletedAt` and bulk-updates all payment entities. Idempotent: skips if already terminal. Entity creation is idempotent (409 Conflict ignored). Batch statuses: `Queued`, `Processing`, `Processed`, `Error`.
 
-**Storage**: Durable Functions and Table Storage use the `AzureWebJobsStorage` connection string. Application queues (`batch-processing-queue`, `gl-error-queue`) use the `BatchStorageConnection` connection string, keeping application data separate from the function runtime's internal storage. Locally both point to Azurite. In production: App 1 uses a dedicated storage account for Table Storage (batch/payment tracking); App 2 uses a dedicated storage account for its queues and the function app's built-in storage for Durable Functions state.
+**Batch payment data**: Azure Table Storage (`BatchPayments` table) via `IBatchPaymentStore` / `TableBatchPaymentStore`. Two entity levels: metadata (PK: "metadata", RK: batchId, stores CallbackUrl and PaymentCount) and payment (PK: batchId, RK: paymentId, EntityType: "payment", all PaymentData fields). Written by `ReceiveBatchRequest`, read by orchestration activities (`CreatePaymentFile`, `CreateGLFile`). Uses `BatchStorageConnection`.
+
+**Storage**: Durable Functions and App 1's Table Storage use the `AzureWebJobsStorage` connection string. Application queues (`batch-processing-queue`, `gl-error-queue`) and the `BatchPayments` table use the `BatchStorageConnection` connection string, keeping App 2's application data separate from the function runtime's internal storage. Locally both point to Azurite. In production: App 1 uses a dedicated storage account for Table Storage (batch/payment tracking); App 2 uses a dedicated storage account for its queues, BatchPayments table, and the function app's built-in storage for Durable Functions state.
 
 **SFTP**: SSH.NET (`Renci.SshNet`) via `ISftpClientFactory` / `SftpClientFactory`. Connections are async (`ConnectAsync`). Each activity creates a new connection — pooling is not feasible across Durable Functions activities. Local server via OpenSSH Docker container (port 2222).
 
 **File layout**:
 ```
-Program.cs                    Entry point and DI configuration
-Models.cs                     Shared records, DTOs, and BatchStatus constants
-BatchTracking.cs              IBatchTracker interface + TableBatchTracker implementation
-SftpClientFactory.cs          ISftpClientFactory interface + SftpClientFactory implementation
-MessageQueue.cs               IMessageQueue + IGLErrorQueue interfaces + implementations
-BatchProcessor.cs             HTTP receiver + queue triggers (App 2 entry points)
-BatchOrchestration.cs         Orchestrator, file creation/upload activities, callback, GL error queue
-SftpEndpoints.cs              SFTP test/debug endpoints (ListFiles, GetFile, DeleteAllFiles)
-BatchCoordinator.cs           Timer/HTTP triggers, batch status, callback webhook (App 1)
-host.json                     Azure Functions, durable task, and queue config
-docker-compose.yml            Azurite + SFTP containers for local dev
-test-batch-orchestration.sh   E2E test script
-tests/AzFunctions.Tests/      xUnit + NSubstitute unit tests (see Testing section)
+Program.cs                         Entry point and DI configuration
+Models/
+  Models.cs                        Shared records, DTOs, and BatchStatus constants
+GM/                                App 1 — Coordinator
+  BatchCoordinator.cs              Timer/HTTP triggers, batch status, callback webhook
+  BatchTracking.cs                 IBatchTracker interface + TableBatchTracker implementation
+Fin/                               App 2 — Batch Processor
+  BatchProcessor.cs                HTTP receiver + queue triggers (entry points)
+  BatchOrchestration.cs            Orchestrator, file creation/upload activities, callback, GL error queue
+  BatchPaymentStore.cs             IBatchPaymentStore interface + TableBatchPaymentStore implementation
+  SftpClientFactory.cs             ISftpClientFactory interface + SftpClientFactory implementation
+  MessageQueue.cs                  IMessageQueue + IGLErrorQueue interfaces + implementations
+  SftpEndpoints.cs                 SFTP test/debug endpoints (ListFiles, GetFile, DeleteAllFiles)
+host.json                          Azure Functions, durable task, and queue config
+docker-compose.yml                 Azurite + SFTP containers for local dev
+test-batch-orchestration.sh        E2E test script
+tests/AzFunctions.Tests/           xUnit + NSubstitute unit tests (see Testing section)
 ```
 
 ## DI Pattern

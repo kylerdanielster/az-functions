@@ -30,6 +30,15 @@ builder.Services.AddSingleton<IBatchTracker>(sp =>
     return new TableBatchTracker(tableClient);
 });
 
+builder.Services.AddSingleton<IBatchPaymentStore>(sp =>
+{
+    string connectionString = Environment.GetEnvironmentVariable("BatchStorageConnection")
+        ?? throw new InvalidOperationException("BatchStorageConnection not configured.");
+    var tableClient = new TableClient(connectionString, TableBatchPaymentStore.TableName);
+    tableClient.CreateIfNotExists();
+    return new TableBatchPaymentStore(tableClient);
+});
+
 builder.Services.AddSingleton<IMessageQueue>(sp =>
 {
     string connectionString = Environment.GetEnvironmentVariable("BatchStorageConnection")
